@@ -1,0 +1,877 @@
+"""
+Renamer module - handles generating rename plans and executing renames.
+"""
+import os
+import shutil
+import re
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+
+from .config import load_config
+from .scanner import MediaFile
+from .gpt_service import MediaInfo, format_media_info, format_folder_structure
+from .rollback import (
+    RenameManifest, create_manifest_from_plan, save_manifest,
+    load_manifest, update_manifest_status
+)
+
+
+# Patterns that indicate a file/folder is already properly named
+PROPER_NAME_PATTERNS = [
+    # Movies: Title [Year] - must have actual title (3+ chars) before year
+    r'^.{3,}\s*\[\d{4}\]$',
+    # Series folder: Title [Year-Year] or Title [Year-] - must have actual title
+    r'^.{3,}\s*\[\d{4}-\d{0,4}\]$',
+    # Season folder: Season XX (with or without leading zeros)
+    r'^Season\s*\d{1,2}$',
+    # Episode file: Series SxxExx - Title (must have real title, not just "Episode")
+    # This pattern requires the title part to NOT be just "Episode" or "Episode X"
+    r'^.{3,}\s+S\d{2}E\d{2}\s+-\s+(?!Episode(\s+\d+)?$).+$',
+    # NOTE: Files like "Show S01E01" (without title) should be processed to get episode title
+    # So we intentionally do NOT include a pattern for "SxxExx without title"
+]
+
+# Patterns that indicate a file NEEDS to be renamed (bad names)
+BAD_NAME_PATTERNS = [
+    # Just numbers like 01.mkv, 02.mkv
+    r'^\d{1,3}$',
+    # Generic "Episode" title (exactly "Episode")
+    r'.*\s+-\s+Episode$',
+    # Episode files WITHOUT a title (we want to look up the title)
+    r'^.{3,}\s+S\d{2}E\d{2}$',
+    # Generic numbered episode titles like "Episode 1", "Episode 2", "Episodio 1"
+    r'.*\s+-\s+Episode\s+\d+$',
+    r'.*\s+-\s+Episodio\s+\d+$',
+    # Scene release patterns
+    r'.*\b(720p|1080p|2160p|x264|x265|HEVC|BluRay|WEB-DL|HDTV)\b.*',
+]
+
+# Patterns that indicate a FOLDER is a scene-release name needing renaming
+SCENE_FOLDER_PATTERNS = [
+    # Scene release patterns with quality tags
+    r'.*\.(720p|1080p|2160p|4K)\..*',
+    r'.*\b(WEB-DL|WEBRip|BluRay|BDRip|HDTV|DVDRip)\b.*',
+    r'.*\b(x264|x265|HEVC|H\.264|H\.265|AVC)\b.*',
+    r'.*\b(DDP|DD|AAC|AC3|DTS|FLAC)\d*\.?\d*\b.*',
+    r'.*\b(FLUX|RARBG|YTS|NTb|SPARKS|FGT|ETRG|YIFY)\b.*',
+    r'.*-[A-Z]+\[?[a-z]*\]?$',  # Ends with -GROUP or -GROUP[tag]
+]
+
+# BDMV/Blu-ray structure files that should not be renamed
+BDMV_MARKERS = ['index.bdmv', 'movieobject.bdmv', 'bdmv', 'certificate']
+BDMV_INTERNAL_FOLDERS = ['bdmv', 'certificate', 'backup', 'playlist', 'clipinf', 'stream', 'auxdata', 'meta', 'jar']
+
+
+def is_scene_release_folder(folder_name: str) -> bool:
+    """Check if a folder name looks like a scene-release name that needs cleanup."""
+    for pattern in SCENE_FOLDER_PATTERNS:
+        if re.search(pattern, folder_name, re.IGNORECASE):
+            return True
+    return False
+
+
+def is_already_properly_named(name: str) -> bool:
+    """
+    Check if a file/folder name already matches our target format.
+    Returns False for files that need renaming (bad patterns).
+    """
+    # First check if it matches a BAD pattern - these always need renaming
+    for pattern in BAD_NAME_PATTERNS:
+        if re.match(pattern, name, re.IGNORECASE):
+            return False  # Needs renaming
+
+    # Then check if it matches a GOOD pattern
+    for pattern in PROPER_NAME_PATTERNS:
+        if re.match(pattern, name, re.IGNORECASE):
+            return True
+
+    return False  # Unknown format, should be processed
+
+
+def is_bdmv_folder(folder_path: Path) -> bool:
+    """Check if a folder is a BDMV/Blu-ray disc structure."""
+    try:
+        folder_lower = folder_path.name.lower()
+
+        # Check if this IS a BDMV folder
+        if folder_lower in BDMV_INTERNAL_FOLDERS:
+            return True
+
+        # Check if folder contains BDMV structure
+        for item in folder_path.iterdir():
+            item_lower = item.name.lower()
+            if item_lower in BDMV_MARKERS:
+                return True
+            if item.is_dir() and item_lower == 'bdmv':
+                return True
+
+        return False
+    except (PermissionError, OSError):
+        return False
+
+
+def is_inside_bdmv_structure(file_path: Path) -> bool:
+    """Check if a file is inside a BDMV structure (should not be moved)."""
+    path_parts = [p.lower() for p in file_path.parts]
+    for marker in BDMV_INTERNAL_FOLDERS:
+        if marker in path_parts:
+            return True
+    return False
+
+
+def get_bdmv_parent_folder(file_path: Path) -> Optional[Path]:
+    """
+    Get the parent folder of a BDMV structure that should be renamed.
+    Returns the outermost folder that contains the BDMV structure.
+    """
+    current = file_path.parent
+    bdmv_root = None
+
+    while current.name:
+        if current.name.lower() in BDMV_INTERNAL_FOLDERS:
+            bdmv_root = current.parent
+        elif is_bdmv_folder(current):
+            bdmv_root = current
+        current = current.parent
+
+        # Safety: don't go more than 5 levels up
+        if len(file_path.parts) - len(current.parts) > 5:
+            break
+
+    return bdmv_root
+
+
+@dataclass
+class RenamePlan:
+    """A complete rename plan ready for preview/execution."""
+    manifest: RenameManifest
+    high_confidence: List[Dict]  # confidence >= threshold
+    low_confidence: List[Dict]   # confidence < threshold
+    unknown: List[Dict]          # media_type == "unknown"
+    skipped: List[Dict]          # already named correctly
+    folder_renames: List[Dict] = None  # parent folder renames needed
+
+    def __post_init__(self):
+        if self.folder_renames is None:
+            self.folder_renames = []
+
+
+def save_plan_to_file(plan: RenamePlan, config: Optional[dict] = None) -> str:
+    """
+    Save the rename plan to a text file for review before applying.
+
+    Args:
+        plan: The RenamePlan to save
+        config: Optional config dict
+
+    Returns:
+        Path to the saved plan file
+    """
+    if config is None:
+        config = load_config()
+
+    # Create filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plan_filename = f"rename_plan_{timestamp}.txt"
+
+    # Get app directory
+    app_dir = Path(__file__).parent
+    plan_path = app_dir / plan_filename
+
+    lines = []
+    lines.append("=" * 80)
+    lines.append("  RENAME PLAN - REVIEW BEFORE APPLYING")
+    lines.append("=" * 80)
+    lines.append(f"\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Manifest ID: {plan.manifest.id}")
+    lines.append(f"Root Path: {plan.manifest.root_path}")
+    lines.append("")
+
+    # Summary
+    lines.append("-" * 80)
+    lines.append("SUMMARY")
+    lines.append("-" * 80)
+    lines.append(f"  High confidence renames: {len(plan.high_confidence)}")
+    lines.append(f"  Low confidence renames:  {len(plan.low_confidence)}")
+    lines.append(f"  Unknown (skipped):       {len(plan.unknown)}")
+    lines.append(f"  Already correct:         {len(plan.skipped)}")
+
+    # Folder renames
+    if plan.folder_renames:
+        lines.append(f"  Folder renames needed:   {len(plan.folder_renames)}")
+
+    total_subs = sum(len(item.get("subtitles", [])) for item in plan.high_confidence + plan.low_confidence)
+    if total_subs > 0:
+        lines.append(f"  Subtitles to rename:     {total_subs}")
+
+    # Count moves vs renames
+    moves = 0
+    renames_only = 0
+    for item in plan.high_confidence + plan.low_confidence:
+        old_dir = Path(item["original_path"]).parent
+        new_dir = Path(item["new_path"]).parent
+        if old_dir != new_dir:
+            moves += 1
+        else:
+            renames_only += 1
+
+    lines.append("")
+    lines.append(f"  Files to MOVE (different folder): {moves}")
+    lines.append(f"  Files to RENAME (same folder):    {renames_only}")
+    lines.append("")
+
+    # Folder renames section
+    if plan.folder_renames:
+        lines.append("=" * 80)
+        lines.append(f"FOLDER RENAMES ({len(plan.folder_renames)} folders)")
+        lines.append("=" * 80)
+        lines.append("")
+        lines.append("  These folders will be renamed FIRST, before file operations:")
+        lines.append("")
+        for i, fr in enumerate(plan.folder_renames, 1):
+            lines.append(f"  [{i}] {fr['type'].upper()}")
+            lines.append(f"      OLD: {fr['original_name']}")
+            lines.append(f"      NEW: {fr['new_name']}")
+            lines.append(f"      Path: {fr['original_path']}")
+            lines.append("")
+
+    # High confidence operations
+    if plan.high_confidence:
+        lines.append("=" * 80)
+        lines.append(f"HIGH CONFIDENCE OPERATIONS ({len(plan.high_confidence)} files)")
+        lines.append("=" * 80)
+
+        for i, item in enumerate(plan.high_confidence, 1):
+            old_path = Path(item["original_path"])
+            new_path = Path(item["new_path"])
+            old_dir = old_path.parent
+            new_dir = new_path.parent
+
+            is_move = old_dir != new_dir
+
+            lines.append("")
+            lines.append(f"[{i}] {item['media_type'].upper()} - {item['title']} ({item['confidence']}% confidence)")
+            lines.append(f"    OLD: {old_path}")
+            lines.append(f"    NEW: {new_path}")
+
+            if is_move:
+                lines.append(f"    ACTION: MOVE (folder change)")
+                lines.append(f"      From folder: {old_dir}")
+                lines.append(f"      To folder:   {new_dir}")
+            else:
+                lines.append(f"    ACTION: RENAME (same folder)")
+
+            # Subtitles
+            for sub in item.get("subtitles", []):
+                lang = sub.get("language", "unknown")
+                lines.append(f"    + SUBTITLE ({lang}): {Path(sub['original_path']).name} -> {Path(sub['new_path']).name}")
+
+    # Low confidence operations
+    if plan.low_confidence:
+        lines.append("")
+        lines.append("=" * 80)
+        lines.append(f"LOW CONFIDENCE OPERATIONS - REVIEW CAREFULLY ({len(plan.low_confidence)} files)")
+        lines.append("=" * 80)
+
+        for i, item in enumerate(plan.low_confidence, 1):
+            old_path = Path(item["original_path"])
+            new_path = Path(item["new_path"])
+            old_dir = old_path.parent
+            new_dir = new_path.parent
+
+            is_move = old_dir != new_dir
+
+            lines.append("")
+            lines.append(f"[{i}] {item['media_type'].upper()} - {item['title']} ({item['confidence']}% confidence)")
+            if item.get("notes"):
+                lines.append(f"    NOTE: {item['notes']}")
+            lines.append(f"    OLD: {old_path}")
+            lines.append(f"    NEW: {new_path}")
+
+            if is_move:
+                lines.append(f"    ACTION: MOVE")
+            else:
+                lines.append(f"    ACTION: RENAME")
+
+    # Skipped files
+    if plan.skipped:
+        lines.append("")
+        lines.append("=" * 80)
+        lines.append(f"SKIPPED FILES ({len(plan.skipped)} files)")
+        lines.append("=" * 80)
+
+        for item in plan.skipped:
+            reason = item.get("reason", "Unknown reason")
+            lines.append(f"  - {Path(item['original_path']).name}")
+            lines.append(f"    Reason: {reason}")
+
+    # Footer
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("END OF PLAN")
+    lines.append("=" * 80)
+    lines.append("")
+    lines.append("To apply this plan, use the 'Apply Renames' option in the menu.")
+    lines.append("All operations can be rolled back using the manifest ID.")
+    lines.append("")
+
+    # Write to file
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return str(plan_path)
+
+
+def sanitize_filename(name: str) -> str:
+    """Remove invalid characters from filename."""
+    # Windows forbidden characters: \ / : * ? " < > |
+    invalid_chars = r'[\\/:*?"<>|]'
+    sanitized = re.sub(invalid_chars, '', name)
+    # Remove leading/trailing spaces and dots
+    sanitized = sanitized.strip('. ')
+    # Collapse multiple spaces
+    sanitized = re.sub(r'\s+', ' ', sanitized)
+    return sanitized
+
+
+def generate_rename_plan(
+    media_files: List[MediaFile],
+    media_infos: List[MediaInfo],
+    root_path: str,
+    config: Optional[dict] = None,
+    force: bool = False
+) -> RenamePlan:
+    """
+    Generate a complete rename plan from scanned files and GPT identifications.
+
+    Args:
+        media_files: List of scanned MediaFile objects
+        media_infos: List of MediaInfo from GPT
+        root_path: The root scanning path
+        config: Optional config dict
+        force: If True, skip 'already properly named' check and process all files
+        media_infos: List of MediaInfo from GPT
+        root_path: The root scanning path
+        config: Optional config dict
+
+    Returns:
+        RenamePlan with categorized operations
+    """
+    if config is None:
+        config = load_config()
+
+    threshold = config.get("confidence_threshold", 80)
+    restructure = config.get("restructure_folders", True)
+
+    # Create lookup by original filename
+    info_lookup = {info.original_filename: info for info in media_infos}
+
+    plan_items = []
+    high_confidence = []
+    low_confidence = []
+    unknown = []
+    skipped = []
+
+    for media_file in media_files:
+        info = info_lookup.get(media_file.filename)
+
+        if not info:
+            # No GPT info found, skip
+            skipped.append({
+                "original_path": str(media_file.path),
+                "reason": "No GPT identification available"
+            })
+            continue
+
+        # Check if file is inside a BDMV structure - don't move internal files
+        if is_inside_bdmv_structure(media_file.path):
+            bdmv_parent = get_bdmv_parent_folder(media_file.path)
+            if bdmv_parent:
+                # Only rename the BDMV parent folder, not internal files
+                skipped.append({
+                    "original_path": str(media_file.path),
+                    "reason": f"Inside BDMV structure (parent: {bdmv_parent.name})"
+                })
+                continue
+
+        # Check if file/folder is already properly named (smart skip for re-runs)
+        # Skip this check if force=True
+        if not force:
+            current_filename = media_file.path.stem
+            current_parent = media_file.path.parent.name
+
+            # Check if the filename already matches our format
+            if is_already_properly_named(current_filename) or is_already_properly_named(f"{current_filename}{media_file.extension}"):
+                # Also check if parent folder structure looks correct
+                parent_looks_correct = (
+                    is_already_properly_named(current_parent) or
+                    current_parent.lower().startswith("season")
+                )
+                if parent_looks_correct:
+                    skipped.append({
+                        "original_path": str(media_file.path),
+                        "reason": "Already matches target naming format"
+                    })
+                    continue
+
+        # Generate new filename
+        new_filename = sanitize_filename(format_media_info(info, config))
+        new_filename_with_ext = new_filename + media_file.extension
+
+        # Determine new path
+        if restructure and info.media_type != "unknown":
+            # Get folder structure (e.g., "Series Name [Year]/Season XX")
+            folder_structure = format_folder_structure(info, config)
+
+            # Check if root_path already contains the series folder
+            # This prevents duplication like "Series [Year]/Series [Year]/Season XX"
+            root_name = Path(root_path).name
+            folder_parts = folder_structure.split("/")
+
+            if len(folder_parts) >= 1:
+                series_folder = folder_parts[0]  # e.g., "Money Heist [2017-2021]"
+
+                # Check if root folder name matches or contains the series name
+                # Match cases like: root="Money Heist [2017-2021]" and series_folder="Money Heist [2017-2021]"
+                if root_name == series_folder or root_name.startswith(info.title):
+                    # Root is already the series folder, only use season folder
+                    if len(folder_parts) > 1:
+                        folder_structure = "/".join(folder_parts[1:])  # Just "Season XX"
+                    else:
+                        folder_structure = ""  # No subfolder needed
+
+            folder_structure = sanitize_filename(folder_structure.replace("/", os.sep))
+
+            # Build new path under root
+            if folder_structure:
+                new_dir = Path(root_path) / folder_structure
+            else:
+                new_dir = Path(root_path)
+            new_path = new_dir / new_filename_with_ext
+        else:
+            # Keep in same directory
+            new_path = media_file.path.parent / new_filename_with_ext
+
+        # Check if already correctly named (exact path match)
+        if str(media_file.path) == str(new_path):
+            skipped.append({
+                "original_path": str(media_file.path),
+                "reason": "Already correctly named"
+            })
+            continue
+
+        # Handle subtitles - generate rename operations for associated subtitles
+        subtitle_operations = []
+        if config.get("rename_subtitles", True) and hasattr(media_file, 'subtitles') and media_file.subtitles:
+            for sub in media_file.subtitles:
+                # Build new subtitle filename with same base name
+                lang_suffix = f".{sub.language}" if sub.language else ""
+                new_sub_filename = f"{new_filename}{lang_suffix}{sub.extension}"
+
+                # Determine subtitle new path
+                if restructure and info.media_type != "unknown":
+                    new_sub_path = new_dir / new_sub_filename
+                else:
+                    new_sub_path = media_file.path.parent / new_sub_filename
+
+                if str(sub.path) != str(new_sub_path):
+                    subtitle_operations.append({
+                        "original_path": str(sub.path),
+                        "new_path": str(new_sub_path),
+                        "type": "subtitle",
+                        "language": sub.language
+                    })
+
+        plan_item = {
+            "original_path": str(media_file.path),
+            "new_path": str(new_path),
+            "media_type": info.media_type,
+            "title": info.title,
+            "year": info.year,
+            "season": info.season,
+            "episode": info.episode,
+            "confidence": info.confidence,
+            "notes": info.notes,
+            "subtitles": subtitle_operations  # Include subtitle operations
+        }
+
+        plan_items.append(plan_item)
+
+        # Categorize by confidence
+        if info.media_type == "unknown":
+            unknown.append(plan_item)
+        elif info.confidence >= threshold:
+            high_confidence.append(plan_item)
+        else:
+            low_confidence.append(plan_item)
+
+    # Detect if parent folders need renaming BEFORE creating manifest
+    folder_renames = []
+
+    # Check the root path itself - is it a scene-release folder?
+    root = Path(root_path)
+    root_name = root.name
+
+    if is_scene_release_folder(root_name) and media_infos:
+        # Use the first media info to determine what the folder should be named
+        first_info = media_infos[0]
+        if first_info.media_type == "series":
+            year_range = first_info.year_range
+            if year_range:
+                correct_name = f"{first_info.title} [{year_range}]"
+            else:
+                correct_name = first_info.title
+        elif first_info.media_type == "movie":
+            if first_info.year:
+                correct_name = f"{first_info.title} [{first_info.year}]"
+            else:
+                correct_name = first_info.title
+        else:
+            correct_name = None
+
+        if correct_name and correct_name != root_name:
+            new_root_path = root.parent / sanitize_filename(correct_name)
+            folder_renames.append({
+                "original_path": str(root),
+                "new_path": str(new_root_path),
+                "original_name": root_name,
+                "new_name": sanitize_filename(correct_name),
+                "type": "series_folder" if first_info.media_type == "series" else "movie_folder",
+                "confidence": first_info.confidence
+            })
+
+            # Update all file paths in the plan to reflect the new root
+            for item in plan_items:
+                old_path = item["original_path"]
+                new_path = item["new_path"]
+                # Update new_path to use the corrected root folder
+                item["new_path"] = new_path.replace(str(root), str(new_root_path))
+
+    # Also check intermediate folders in the path for scene-release names
+    # This handles cases like: D:\SeriesName\Scene.Release.Folder\Season 1\file.mkv
+    checked_folders = set()
+    for media_file in media_files:
+        current = media_file.path.parent
+        while current != root and current.name:
+            folder_name = current.name
+            if folder_name not in checked_folders and is_scene_release_folder(folder_name):
+                checked_folders.add(folder_name)
+                # This intermediate folder needs renaming
+                # Try to determine correct name from the files inside
+                info = info_lookup.get(media_file.filename)
+                if info and info.season:
+                    # It's likely a season folder that looks like a scene release
+                    correct_name = f"Season {info.season:02d}"
+                    if folder_name != correct_name:
+                        folder_renames.append({
+                            "original_path": str(current),
+                            "new_path": str(current.parent / correct_name),
+                            "original_name": folder_name,
+                            "new_name": correct_name,
+                            "type": "season_folder",
+                            "confidence": info.confidence if info else 50
+                        })
+            current = current.parent
+
+    # Create manifest with folder_renames included
+    manifest = create_manifest_from_plan(plan_items, root_path, folder_renames)
+
+    return RenamePlan(
+        manifest=manifest,
+        high_confidence=high_confidence,
+        low_confidence=low_confidence,
+        unknown=unknown,
+        skipped=skipped,
+        folder_renames=folder_renames
+    )
+
+
+def format_rename_preview(plan: RenamePlan, show_all: bool = False) -> str:
+    """Format the rename plan for preview display."""
+    lines = [
+        f"\n{'='*80}",
+        f"  RENAME PREVIEW",
+        f"{'='*80}",
+        f"\n  Summary:",
+        f"    ✓ High confidence (will rename):  {len(plan.high_confidence)}",
+        f"    ? Low confidence (needs review):  {len(plan.low_confidence)}",
+        f"    ✗ Unknown (skipped):              {len(plan.unknown)}",
+        f"    - Already correct (skipped):      {len(plan.skipped)}",
+    ]
+
+    # Folder renames
+    if plan.folder_renames:
+        lines.append(f"    📁 Folders to rename:             {len(plan.folder_renames)}")
+
+    lines.append(f"    ─────────────────────────────────")
+    lines.append(f"    Total operations:                 {len(plan.high_confidence) + len(plan.low_confidence)}")
+
+    # Count subtitles
+    total_subs = sum(len(item.get("subtitles", [])) for item in plan.high_confidence + plan.low_confidence)
+    if total_subs > 0:
+        lines.append(f"    📝 Subtitles to rename:           {total_subs}")
+
+    # Folder renames section
+    if plan.folder_renames:
+        lines.append(f"\n  {'─'*76}")
+        lines.append(f"  📁 FOLDER RENAMES (will be renamed FIRST):")
+        lines.append(f"  {'─'*76}")
+        for fr in plan.folder_renames:
+            lines.append(f"\n  [{fr['confidence']}%] {fr['type'].upper()}")
+            lines.append(f"       OLD: {fr['original_name']}")
+            lines.append(f"       NEW: {fr['new_name']}")
+
+    # High confidence items
+    if plan.high_confidence:
+        lines.append(f"\n  {'─'*76}")
+        lines.append(f"  HIGH CONFIDENCE RENAMES ({len(plan.high_confidence)} files):")
+        lines.append(f"  {'─'*76}")
+
+        display_items = plan.high_confidence if show_all else plan.high_confidence[:10]
+        for item in display_items:
+            old_name = Path(item["original_path"]).name
+            new_name = Path(item["new_path"]).name
+            sub_count = len(item.get("subtitles", []))
+            sub_info = f" +{sub_count} subs" if sub_count > 0 else ""
+            lines.append(f"\n  [{item['confidence']}%] {item['media_type'].upper()}{sub_info}")
+            lines.append(f"    FROM: {old_name}")
+            lines.append(f"    TO:   {new_name}")
+            if item.get("notes"):
+                lines.append(f"    NOTE: {item['notes']}")
+
+        if not show_all and len(plan.high_confidence) > 10:
+            lines.append(f"\n  ... and {len(plan.high_confidence) - 10} more (use --all to see all)")
+
+    # Low confidence items
+    if plan.low_confidence:
+        lines.append(f"\n  {'─'*76}")
+        lines.append(f"  ⚠️  LOW CONFIDENCE - NEEDS REVIEW ({len(plan.low_confidence)} files):")
+        lines.append(f"  {'─'*76}")
+
+        for item in plan.low_confidence:
+            old_name = Path(item["original_path"]).name
+            new_name = Path(item["new_path"]).name
+            sub_count = len(item.get("subtitles", []))
+            sub_info = f" +{sub_count} subs" if sub_count > 0 else ""
+            lines.append(f"\n  [{item['confidence']}%] {item['media_type'].upper()}{sub_info}")
+            lines.append(f"    FROM: {old_name}")
+            lines.append(f"    TO:   {new_name}")
+            if item.get("notes"):
+                lines.append(f"    NOTE: {item['notes']}")
+
+    # Unknown items
+    if plan.unknown:
+        lines.append(f"\n  {'─'*76}")
+        lines.append(f"  ❌ UNKNOWN - WILL BE SKIPPED ({len(plan.unknown)} files):")
+        lines.append(f"  {'─'*76}")
+
+        for item in plan.unknown[:5]:
+            old_name = Path(item["original_path"]).name
+            lines.append(f"    - {old_name}")
+
+        if len(plan.unknown) > 5:
+            lines.append(f"    ... and {len(plan.unknown) - 5} more")
+
+    lines.append(f"\n{'='*80}")
+    lines.append(f"  To apply high-confidence renames: renamer apply")
+    lines.append(f"  To apply ALL renames (incl. low): renamer apply --include-low-confidence")
+    lines.append(f"{'='*80}\n")
+
+    return "\n".join(lines)
+
+
+def execute_rename_plan(
+    manifest: RenameManifest,
+    include_low_confidence: bool = False,
+    config: Optional[dict] = None,
+    folder_renames: List[Dict] = None
+) -> Tuple[int, int, List[str]]:
+    """
+    Execute the rename operations in a manifest.
+
+    Args:
+        manifest: The manifest to execute
+        include_low_confidence: Whether to include low-confidence renames
+        config: Optional config dict
+        folder_renames: List of folder rename operations to execute first
+
+    Returns:
+        Tuple of (successful_count, failed_count, error_messages)
+    """
+    if config is None:
+        config = load_config()
+
+    threshold = config.get("confidence_threshold", 80)
+
+    # Save manifest first (for rollback)
+    save_manifest(manifest, config)
+
+    successful = 0
+    failed = 0
+    errors = []
+
+    # Execute folder renames FIRST (before file operations)
+    folder_path_mapping = {}  # Track old -> new path mappings
+    if folder_renames:
+        for fr in folder_renames:
+            try:
+                old_folder = Path(fr["original_path"])
+                new_folder = Path(fr["new_path"])
+
+                if old_folder.exists() and not new_folder.exists():
+                    old_folder.rename(new_folder)
+                    folder_path_mapping[str(old_folder)] = str(new_folder)
+                    successful += 1
+                elif new_folder.exists():
+                    # Target already exists - might be a duplicate
+                    errors.append(f"Folder already exists: {new_folder}")
+                else:
+                    errors.append(f"Source folder not found: {old_folder}")
+            except Exception as e:
+                failed += 1
+                errors.append(f"Failed to rename folder {fr['original_name']}: {str(e)}")
+
+    for op in manifest.operations:
+        # Skip low confidence if not included
+        if not include_low_confidence and op.get("confidence", 0) < threshold:
+            continue
+
+        # Skip unknown
+        if op.get("media_type") == "unknown":
+            continue
+
+        original = Path(op["original_path"])
+        new = Path(op["new_path"])
+
+        # Update paths if parent folder was renamed
+        for old_folder, new_folder in folder_path_mapping.items():
+            if str(original).startswith(old_folder):
+                original = Path(str(original).replace(old_folder, new_folder, 1))
+            if str(new).startswith(old_folder):
+                new = Path(str(new).replace(old_folder, new_folder, 1))
+
+        try:
+            # Create target directory if needed
+            new.parent.mkdir(parents=True, exist_ok=True)
+
+            # Check if target already exists
+            if new.exists():
+                # Add number suffix to avoid overwrite
+                base = new.stem
+                ext = new.suffix
+                counter = 1
+                while new.exists():
+                    new = new.parent / f"{base} ({counter}){ext}"
+                    counter += 1
+
+            # Perform rename/move for video file
+            shutil.move(str(original), str(new))
+            successful += 1
+
+            # Rename associated subtitles
+            subtitle_ops = op.get("subtitles", [])
+            for sub_op in subtitle_ops:
+                try:
+                    sub_original = Path(sub_op["original_path"])
+                    sub_new = Path(sub_op["new_path"])
+
+                    if sub_original.exists():
+                        sub_new.parent.mkdir(parents=True, exist_ok=True)
+
+                        # Handle existing subtitle files
+                        if sub_new.exists():
+                            base = sub_new.stem
+                            ext = sub_new.suffix
+                            counter = 1
+                            while sub_new.exists():
+                                sub_new = sub_new.parent / f"{base} ({counter}){ext}"
+                                counter += 1
+
+                        shutil.move(str(sub_original), str(sub_new))
+                except Exception as sub_e:
+                    # Log subtitle errors but don't fail the operation
+                    errors.append(f"Subtitle warning - {sub_original.name}: {str(sub_e)}")
+
+            # Clean up empty source directories after moving
+            try:
+                original_parent = original.parent
+                root = Path(manifest.root_path)
+                # Remove empty parent directories up to root
+                while original_parent != root and original_parent.exists():
+                    if not any(original_parent.iterdir()):
+                        original_parent.rmdir()
+                        original_parent = original_parent.parent
+                    else:
+                        break
+            except Exception:
+                pass  # Ignore errors cleaning up directories
+
+        except Exception as e:
+            failed += 1
+            errors.append(f"Failed to rename {original.name}: {str(e)}")
+
+    # Update manifest status
+    update_manifest_status(manifest.id, applied=True, config=config)
+
+    return successful, failed, errors
+
+
+def execute_rollback(manifest: RenameManifest, config: Optional[dict] = None) -> Tuple[int, int, List[str]]:
+    """
+    Rollback a previously applied rename operation.
+
+    Args:
+        manifest: The manifest to rollback
+        config: Optional config dict
+
+    Returns:
+        Tuple of (successful_count, failed_count, error_messages)
+    """
+    if not manifest.applied:
+        return 0, 0, ["This manifest has not been applied yet."]
+
+    if manifest.rolled_back:
+        return 0, 0, ["This manifest has already been rolled back."]
+
+    successful = 0
+    failed = 0
+    errors = []
+
+    # Reverse operations
+    for op in manifest.operations:
+        original = Path(op["original_path"])
+        new = Path(op["new_path"])
+
+        # Skip if new file doesn't exist (wasn't renamed)
+        if not new.exists():
+            continue
+
+        try:
+            # Restore original directory if needed
+            original.parent.mkdir(parents=True, exist_ok=True)
+
+            # Move back
+            shutil.move(str(new), str(original))
+            successful += 1
+
+            # Try to remove empty directories
+            try:
+                new_parent = new.parent
+                while new_parent != Path(manifest.root_path):
+                    if new_parent.exists() and not any(new_parent.iterdir()):
+                        new_parent.rmdir()
+                    new_parent = new_parent.parent
+            except:
+                pass  # Ignore errors cleaning up directories
+
+        except Exception as e:
+            failed += 1
+            errors.append(f"Failed to restore {new.name}: {str(e)}")
+
+    # Update manifest status
+    update_manifest_status(manifest.id, rolled_back=True, config=config)
+
+    return successful, failed, errors
+

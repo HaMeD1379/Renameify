@@ -1,0 +1,19 @@
+# Renameify - AI-Powered File Renaming Tool
+# Required dependencies
+
+# LLM Providers
+openai>=1.0.0                    # OpenAI API client (also used for OpenRouter)
+anthropic>=0.30.0                # Anthropic Claude API client
+google-generativeai>=0.5.0       # Google Gemini API client
+
+# HTTP and data validation
+httpx>=0.25.0          # HTTP client (dependency of openai)
+pydantic>=2.0.0        # Data validation (dependency of openai)
+
+# Metadata handling
+mutagen>=1.47.0        # Audio/video metadata reading and writing
+
+# Optional but recommended
+colorama>=0.4.6        # Colored terminal output
+tqdm>=4.65.0           # Progress bars
+certifi>=2023.7.22     # SSL certificates
