@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Optional
 
 APP_NAME = "Renameify"
+APP_VERSION = "2.0.0"
+__version__ = APP_VERSION
+__app_name__ = APP_NAME
 CONFIG_FILENAME = "renameify_config.json"
 
 # Platform presets

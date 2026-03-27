@@ -13,7 +13,7 @@ try:
 except ImportError:
     OpenAI = None
 
-from config import load_config, get_api_key
+from core.config import load_config, get_api_key
 
 
 @dataclass

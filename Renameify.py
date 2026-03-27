@@ -32,10 +32,14 @@ def get_base_path():
         return Path(__file__).parent
 
 
-# Add src directory to path
 BASE_PATH = get_base_path()
-SRC_DIR = BASE_PATH / "src"
-sys.path.insert(0, str(SRC_DIR))
+
+# In dev mode, add src/ to path so `from core.config import ...` etc. work.
+# In frozen mode, PyInstaller already collected all modules via --paths=src,
+# so they live in the PYZ archive and are importable without sys.path hacks.
+if not getattr(sys, 'frozen', False):
+    SRC_DIR = BASE_PATH / "src"
+    sys.path.insert(0, str(SRC_DIR))
 
 
 def main():
@@ -52,8 +56,8 @@ def main():
             print("\nRun without arguments to launch the GUI.")
             return 0
         elif arg in ("--version", "-v"):
-            from src import __version__, __app_name__
-            print(f"{__app_name__} v{__version__}")
+            from core.config import APP_NAME, APP_VERSION
+            print(f"{APP_NAME} v{APP_VERSION}")
             return 0
         elif arg == "--config":
             from core.config import get_config_dir

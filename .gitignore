@@ -81,3 +81,4 @@ build/*.spec
 *.tmp
 *.temp
 *.bak
+/AGENTS.md

@@ -20,16 +20,9 @@ from pathlib import Path
 from datetime import datetime
 
 
-def get_base_path():
-    """Get the base path for resources - handles both dev and PyInstaller bundled modes."""
-    if getattr(sys, 'frozen', False):
-        return Path(sys._MEIPASS)
-    else:
-        return Path(__file__).parent.parent
-
-
-# Add src to path for imports
-sys.path.insert(0, str(get_base_path()))
+# sys.path is set up by the entry point (Renameify.py) in dev mode,
+# and by PyInstaller's --paths=src in frozen mode.
+# No need for additional path manipulation here.
 
 from core.config import (
     load_config, save_config, get_api_key, set_api_key,
@@ -37,7 +30,8 @@ from core.config import (
     set_platform, get_custom_prompt, set_custom_prompt, add_recent_path, get_recent_paths,
     PLATFORM_PLEX, PLATFORM_JELLYFIN, PLATFORM_EMBY, PLATFORM_GENERIC,
     AVAILABLE_MODELS, get_available_models, get_current_model, set_current_model,
-    fetch_available_models, clear_model_cache
+    fetch_available_models, clear_model_cache,
+    APP_NAME as _APP_NAME, APP_VERSION as _APP_VERSION,
 )
 from core.scanner import scan_directory, ScanProgress
 from core.gpt_service import identify_all_media, GPTProgress
@@ -53,8 +47,8 @@ except ImportError:
     METADATA_AVAILABLE = False
 
 
-APP_NAME = "Renameify"
-APP_VERSION = "2.0.0"
+APP_NAME = _APP_NAME
+APP_VERSION = _APP_VERSION
 
 
 class DetailedProgressPanel(ttk.Frame):
