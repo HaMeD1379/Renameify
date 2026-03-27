@@ -38,6 +38,7 @@ from core.gpt_service import identify_all_media, GPTProgress
 from core.renamer import generate_rename_plan, execute_rename_plan, execute_rollback, RenamePlan
 from core.rollback import list_manifests, load_manifest
 from platforms.plex import PLEX_AGENTS, PLEX_SCANNERS
+from utils.folder_filter import smart_filter_folders, format_classification_report
 
 # Try to import metadata module (optional)
 try:
@@ -1027,9 +1028,11 @@ class RenameifyGUI:
                 self.custom_prompt_enabled.set(False)
 
     def _browse_directory(self):
-        path = filedialog.askdirectory()
+        initial_dir = self.current_path.get().strip() or str(Path.home())
+        path = filedialog.askdirectory(initialdir=initial_dir)
         if path:
-            self.current_path.set(path)
+            normalized = os.path.normpath(path)
+            self.current_path.set(normalized)
 
     def _toggle_api_key(self):
         current = self.api_entry.cget("show")
@@ -1294,12 +1297,45 @@ class RenameifyGUI:
 
             # Scan
             self.msg_queue.put(("status", ("Scanning...", 10, "Finding files...")))
+            folders_to_scan = None
+
+            if self.smart_filter_var.get():
+                self.msg_queue.put(("status", ("Scanning...", 10, "Smart filtering folders...")))
+
+                def filter_cb(msg: str):
+                    self.msg_queue.put(("status", ("Scanning...", 10, msg)))
+
+                use_gpt = bool(get_api_key())
+                folders_to_scan, _folders_to_skip, classifications = smart_filter_folders(
+                    path,
+                    config=config,
+                    progress_callback=filter_cb,
+                    use_gpt=use_gpt
+                )
+
+                if classifications:
+                    report = format_classification_report(classifications)
+                    self.msg_queue.put(("info", report))
+
+                # Safety net: never let filtering hide all files.
+                if not folders_to_scan:
+                    self.msg_queue.put((
+                        "info",
+                        "Smart Folder Filter did not find any target folders.\n"
+                        "Falling back to full directory scan to avoid missing media files."
+                    ))
+                    folders_to_scan = None
 
             def scan_cb(p: ScanProgress):
                 details = f"Found {p.files_found} files in {p.folders_scanned} folders"
                 self.msg_queue.put(("status", ("Scanning...", 10, details)))
 
-            media_files = scan_directory(path, config, progress_callback=scan_cb)
+            media_files = scan_directory(
+                path,
+                config,
+                progress_callback=scan_cb,
+                folders_to_scan=folders_to_scan
+            )
 
             if not media_files:
                 mode = config.get("mode", "media")
