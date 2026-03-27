@@ -52,11 +52,103 @@ BAD_NAME_PATTERNS = [
 SCENE_FOLDER_PATTERNS = [
     # Scene release patterns with quality tags
     r'.*\.(720p|1080p|2160p|4K)\..*',
-    r'.*\b(WEB-DL|WEBRip|BluRay|BDRip|HDTV|DVDRip)\b.*',
+    r'.*\b(WEB-DL|WEBRip|BluRay|BDRip|HDTV|DVDRip|BRRip|HDRip)\b.*',
     r'.*\b(x264|x265|HEVC|H\.264|H\.265|AVC)\b.*',
     r'.*\b(DDP|DD|AAC|AC3|DTS|FLAC)\d*\.?\d*\b.*',
     r'.*\b(FLUX|RARBG|YTS|NTb|SPARKS|FGT|ETRG|YIFY)\b.*',
     r'.*-[A-Z]+\[?[a-z]*\]?$',  # Ends with -GROUP or -GROUP[tag]
+    # Collection/compilation junk patterns
+    r'.*\b(Complete\s*(Series|Collection|Season|Box\s*Set)?)\b.*',
+    r'.*\b(The\s*Complete)\b.*',
+    r'.*\b(All\s*Seasons?)\b.*',
+    r'.*\b(Full\s*Series)\b.*',
+    r'.*\b(Season\s*\d+\s*-\s*\d+)\b.*',  # "Season 1 - 5" style
+    r'.*\b(S\d+-S\d+)\b.*',  # "S01-S05" style
+    # Quality/resolution tags without dots
+    r'.*\b(720p|1080p|2160p|4K|576p|480p)\b.*',
+    # Source tags
+    r'.*\b(Remux|REMUX)\b.*',
+    # Extra info junk
+    r'.*\b(Interviews?|Bonus|Extras?|Specials?|Behind.the.Scenes?)\b.*',
+    r'.*\b(Documentary|Making.of)\b.*',
+    # Network/channel names that shouldn't be in folder names
+    r'.*\b(BBC|HBO|Netflix|Amazon|Disney\+?|Hulu|Paramount)\b.*Story.*',
+]
+
+# Junk patterns to REMOVE from folder/file names when cleaning
+JUNK_PATTERNS_TO_REMOVE = [
+    # Quality and source info
+    r'\s*-?\s*DVDRip\s*',
+    r'\s*-?\s*BDRip\s*',
+    r'\s*-?\s*BluRay\s*',
+    r'\s*-?\s*Blu-Ray\s*',
+    r'\s*-?\s*BRRip\s*',
+    r'\s*-?\s*HDRip\s*',
+    r'\s*-?\s*WEB-?DL\s*',
+    r'\s*-?\s*WEBRip\s*',
+    r'\s*-?\s*HDTV\s*',
+    r'\s*-?\s*Remux\s*',
+    r'\s*-?\s*REMUX\s*',
+    # Resolution
+    r'\s*-?\s*\d{3,4}p\s*',  # 480p, 576p, 720p, 1080p, 2160p
+    r'\s*-?\s*4K\s*',
+    r'\s*-?\s*8K\s*',
+    # Codecs
+    r'\s*-?\s*x264\s*',
+    r'\s*-?\s*x265\s*',
+    r'\s*-?\s*HEVC\s*',
+    r'\s*-?\s*H\.?264\s*',
+    r'\s*-?\s*H\.?265\s*',
+    r'\s*-?\s*AVC\s*',
+    r'\s*-?\s*XviD\s*',
+    # Audio
+    r'\s*-?\s*DTS\s*',
+    r'\s*-?\s*AC3\s*',
+    r'\s*-?\s*AAC\s*',
+    r'\s*-?\s*DD\d*\.?\d*\s*',
+    r'\s*-?\s*DDP\d*\.?\d*\s*',
+    r'\s*-?\s*Atmos\s*',
+    r'\s*-?\s*TrueHD\s*',
+    # Collection/compilation junk - be more aggressive
+    r'\s*-?\s*The\s+Complete\s+Collection\s*',
+    r'\s*-?\s*Complete\s+Collection\s*',
+    r'\s*-?\s*The\s+Complete\s+Series\s*',
+    r'\s*-?\s*Complete\s+Series\s*',
+    r'\s*-?\s*Complete\s+Season\s*',
+    r'\s*-?\s*Full\s+Series\s*',
+    r'\s*-?\s*All\s+Seasons?\s*',
+    r'\s*-?\s*Box\s*Set\s*',
+    r'\s*-?\s*The\s+Complete\b',  # Just "The Complete" without requiring what follows
+    r'\bComplete\b',  # Standalone "Complete"
+    r'\s*-?\s*Collection\s*',
+    # Extra content markers (more comprehensive)
+    r'\s*-?\s*Interviews?\s*',
+    r'\s*-?\s*Bonus\s*',
+    r'\s*-?\s*Extras?\s*',
+    r'\s*-?\s*Specials?\s*',
+    r'\s*-?\s*Behind\s+the\s+Scenes?\s*',
+    r'\s*-?\s*Documentary\s*',
+    r'\s*-?\s*Making\s+of\s*',
+    r'\s*-?\s*Deleted\s+Scenes?\s*',
+    r'\s*-?\s*Outtakes?\s*',
+    # Network/production info patterns (expanded)
+    r'\s*-?\s*BBC\s+Story(\s+of\s+\d{4})?\s*',
+    r'\s*-?\s*HBO\s+Story(\s+of\s+\d{4})?\s*',
+    r'\s*-?\s*(BBC|HBO|Netflix|Amazon|Disney|Hulu)\s+(Original|Series|Story|Production)\s*',
+    r'\bNetflix\b',  # Standalone Netflix
+    # Release groups (at end)
+    r'\s*-\s*[A-Z]{2,10}$',
+    r'\s*\[[A-Za-z0-9]+\]$',
+    # Season ranges like "S01-S05" or "Season 1-4"
+    r'\s*-?\s*S\d{1,2}\s*-\s*S\d{1,2}\s*',
+    r'\s*-?\s*Season\s+\d{1,2}\s*-\s*\d{1,2}\s*',
+    r'\s*-?\s*Seasons?\s+\d{1,2}\s*-\s*\d{1,2}\s*',
+    # Individual season markers when not in a season folder context (like "S01" in root folder name)
+    r'\.S\d{1,2}\.',  # .S01. pattern
+    r'\bS\d{2}\b',    # S01 as standalone word
+    # Trailing dashes and junk
+    r'\s*-+\s*$',
+    r'\s+-\s+$',
 ]
 
 # BDMV/Blu-ray structure files that should not be renamed
@@ -70,6 +162,132 @@ def is_scene_release_folder(folder_name: str) -> bool:
         if re.search(pattern, folder_name, re.IGNORECASE):
             return True
     return False
+
+
+def clean_folder_name(folder_name: str) -> str:
+    """
+    Clean a folder name by removing junk patterns (quality tags, release info, etc.)
+    Returns the cleaned title portion.
+    
+    Example:
+        "Only Fools and Horses (1981) The Complete Collection - DVDRip 576p - BBC Story of 2002 Interviews"
+        -> "Only Fools and Horses (1981)"
+    """
+    cleaned = folder_name
+    
+    # Apply all junk removal patterns (multiple passes to catch chained junk)
+    for _ in range(2):  # Two passes to catch patterns that become visible after first removal
+        for pattern in JUNK_PATTERNS_TO_REMOVE:
+            cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
+    
+    # Clean up multiple spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    # Clean up stray dashes and parentheses (multiple times to catch nested cases)
+    for _ in range(3):
+        cleaned = re.sub(r'\s*-\s*$', '', cleaned)  # Trailing dash
+        cleaned = re.sub(r'^\s*-\s*', '', cleaned)  # Leading dash
+        cleaned = re.sub(r'\s+-\s+', ' - ', cleaned)  # Normalize dashes
+        cleaned = re.sub(r'\(\s*\)', '', cleaned)   # Empty parentheses
+        cleaned = re.sub(r'\[\s*\]', '', cleaned)   # Empty brackets
+        cleaned = re.sub(r'\s+', ' ', cleaned)      # Multiple spaces again
+        cleaned = cleaned.strip()
+        
+    # Final cleanup: remove trailing punctuation and spaces
+    cleaned = re.sub(r'[\s\-_\.]+$', '', cleaned)
+    cleaned = re.sub(r'^[\s\-_\.]+', '', cleaned)
+    
+    return cleaned.strip()
+
+
+def extract_title_and_year_from_folder(folder_name: str) -> tuple:
+    """
+    Extract clean title and year(s) from a messy folder name.
+    
+    Returns:
+        (title, year, year_start, year_end) - year is for movies, year_start/year_end for series
+    
+    Examples:
+        "Only Fools and Horses (1981) The Complete Collection..."
+        -> ("Only Fools and Horses", None, 1981, None)
+        
+        "Breaking Bad [2008-2013] Complete Series..."
+        -> ("Breaking Bad", None, 2008, 2013)
+    """
+    # First clean the folder name
+    cleaned = clean_folder_name(folder_name)
+    
+    # Try to extract year range [YYYY-YYYY] or (YYYY-YYYY)
+    year_range_match = re.search(r'[\[\(](\d{4})\s*-\s*(\d{4})?[\]\)]', cleaned)
+    if year_range_match:
+        title = re.sub(r'\s*[\[\(]\d{4}\s*-\s*\d{0,4}[\]\)]\s*', '', cleaned).strip()
+        year_start = int(year_range_match.group(1))
+        year_end = int(year_range_match.group(2)) if year_range_match.group(2) else None
+        return (title, None, year_start, year_end)
+    
+    # Try to extract single year [YYYY] or (YYYY)
+    year_match = re.search(r'[\[\(](\d{4})[\]\)]', cleaned)
+    if year_match:
+        title = re.sub(r'\s*[\[\(]\d{4}[\]\)]\s*', '', cleaned).strip()
+        year = int(year_match.group(1))
+        return (title, year, year, None)  # Could be movie or series start year
+    
+    # No year found
+    return (cleaned, None, None, None)
+
+
+def normalize_season_folder_name(folder_name: str) -> Optional[str]:
+    """
+    Normalize various season folder naming patterns to "Season XX" format.
+    
+    Examples:
+        "Series 1" -> "Season 01"
+        "S01" -> "Season 01" 
+        "Season 1" -> "Season 01"
+        "Season.01" -> "Season 01"
+        "season1" -> "Season 01"
+    
+    Returns None if the folder doesn't appear to be a season folder.
+    """
+    folder_lower = folder_name.lower().strip()
+    
+    # Pattern: "Series X" or "Series XX" (British TV style)
+    match = re.match(r'^series\s*(\d{1,2})$', folder_lower, re.IGNORECASE)
+    if match:
+        season_num = int(match.group(1))
+        return f"Season {season_num:02d}"
+    
+    # Pattern: "S01", "S1", "s01"
+    match = re.match(r'^s(\d{1,2})$', folder_lower, re.IGNORECASE)
+    if match:
+        season_num = int(match.group(1))
+        return f"Season {season_num:02d}"
+    
+    # Pattern: "Season 1", "Season 01", "Season.01", "Season.1", "season1"
+    match = re.match(r'^season[\s\.]*(\d{1,2})$', folder_lower, re.IGNORECASE)
+    if match:
+        season_num = int(match.group(1))
+        return f"Season {season_num:02d}"
+    
+    # Pattern: "Staffel X" (German)
+    match = re.match(r'^staffel\s*(\d{1,2})$', folder_lower, re.IGNORECASE)
+    if match:
+        season_num = int(match.group(1))
+        return f"Season {season_num:02d}"
+    
+    # Pattern: "Temporada X" (Spanish)
+    match = re.match(r'^temporada\s*(\d{1,2})$', folder_lower, re.IGNORECASE)
+    if match:
+        season_num = int(match.group(1))
+        return f"Season {season_num:02d}"
+    
+    # Pattern: "Saison X" (French)
+    match = re.match(r'^saison\s*(\d{1,2})$', folder_lower, re.IGNORECASE)
+    if match:
+        season_num = int(match.group(1))
+        return f"Season {season_num:02d}"
+    
+    return None
 
 
 def is_already_properly_named(name: str) -> bool:
@@ -510,10 +728,11 @@ def generate_rename_plan(
     # Detect if parent folders need renaming BEFORE creating manifest
     folder_renames = []
 
-    # Check the root path itself - is it a scene-release folder?
+    # Check the root path itself - is it a scene-release folder or needs cleaning?
     root = Path(root_path)
     root_name = root.name
 
+    # Check if root folder needs renaming (has junk in name)
     if is_scene_release_folder(root_name) and media_infos:
         # Use the first media info to determine what the folder should be named
         first_info = media_infos[0]
@@ -549,30 +768,48 @@ def generate_rename_plan(
                 # Update new_path to use the corrected root folder
                 item["new_path"] = new_path.replace(str(root), str(new_root_path))
 
-    # Also check intermediate folders in the path for scene-release names
+    # Also check intermediate folders in the path for scene-release names or season folder normalization
     # This handles cases like: D:\SeriesName\Scene.Release.Folder\Season 1\file.mkv
+    # Or: D:\Series\Series 1\file.mkv (British "Series X" naming)
     checked_folders = set()
     for media_file in media_files:
         current = media_file.path.parent
         while current != root and current.name:
             folder_name = current.name
-            if folder_name not in checked_folders and is_scene_release_folder(folder_name):
-                checked_folders.add(folder_name)
-                # This intermediate folder needs renaming
-                # Try to determine correct name from the files inside
-                info = info_lookup.get(media_file.filename)
-                if info and info.season:
-                    # It's likely a season folder that looks like a scene release
-                    correct_name = f"Season {info.season:02d}"
-                    if folder_name != correct_name:
-                        folder_renames.append({
-                            "original_path": str(current),
-                            "new_path": str(current.parent / correct_name),
-                            "original_name": folder_name,
-                            "new_name": correct_name,
-                            "type": "season_folder",
-                            "confidence": info.confidence if info else 50
-                        })
+            folder_path_str = str(current)
+            
+            if folder_path_str not in checked_folders:
+                checked_folders.add(folder_path_str)
+                
+                # Check if this is a season folder that needs normalization
+                # (e.g., "Series 1" -> "Season 01", "S01" -> "Season 01")
+                normalized_season = normalize_season_folder_name(folder_name)
+                if normalized_season and normalized_season != folder_name:
+                    # This is a season folder that needs renaming
+                    folder_renames.append({
+                        "original_path": str(current),
+                        "new_path": str(current.parent / normalized_season),
+                        "original_name": folder_name,
+                        "new_name": normalized_season,
+                        "type": "season_folder",
+                        "confidence": 90  # High confidence for season folder normalization
+                    })
+                elif is_scene_release_folder(folder_name):
+                    # This intermediate folder needs renaming
+                    # Try to determine correct name from the files inside
+                    info = info_lookup.get(media_file.filename)
+                    if info and info.season:
+                        # It's likely a season folder that looks like a scene release
+                        correct_name = f"Season {info.season:02d}"
+                        if folder_name != correct_name:
+                            folder_renames.append({
+                                "original_path": str(current),
+                                "new_path": str(current.parent / correct_name),
+                                "original_name": folder_name,
+                                "new_name": correct_name,
+                                "type": "season_folder",
+                                "confidence": info.confidence if info else 50
+                            })
             current = current.parent
 
     # Create manifest with folder_renames included

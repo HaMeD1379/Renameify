@@ -131,7 +131,22 @@ def scan_directory(
     if not root.is_dir():
         raise NotADirectoryError(f"Not a directory: {root_path}")
 
-    video_extensions = set(ext.lower() for ext in config.get("video_extensions", []))
+    # Determine which extensions to scan based on mode
+    mode = config.get("mode", "media")
+    
+    if mode == "mass":
+        # Mass rename mode - scan all files or specific extensions
+        mass_extensions = config.get("mass_rename_extensions", ["*"])
+        if "*" in mass_extensions or not mass_extensions:
+            # Scan ALL files - use None to indicate no filtering
+            file_extensions = None
+        else:
+            file_extensions = set(ext.lower() if ext.startswith('.') else f'.{ext.lower()}' 
+                                 for ext in mass_extensions)
+    else:
+        # Media mode - only video files
+        file_extensions = set(ext.lower() for ext in config.get("video_extensions", []))
+    
     subtitle_extensions = set(ext.lower() for ext in config.get("subtitle_extensions", []))
 
     media_files = []
@@ -204,7 +219,9 @@ def scan_directory(
                 file_path = current_dir / filename
                 extension = file_path.suffix.lower()
 
-                if extension in video_extensions:
+                # Check if file matches our target extensions
+                # file_extensions=None means scan ALL files (mass mode with "*")
+                if file_extensions is None or extension in file_extensions:
                     try:
                         size_mb = file_path.stat().st_size / (1024 * 1024)
                     except OSError:

@@ -403,6 +403,13 @@ Renameify/
 │       ├── folder_filter.py    # Smart folder filtering logic
 │       └── folder_fixer.py     # Folder structure corrections
 │
+├── icon/                       # Application icons
+│   ├── icon.png                # Source icon (high resolution)
+│   └── icon.ico                # Windows icon (multi-size)
+│
+├── build/                      # Build system
+│   └── build.py                # Build script (installs deps automatically)
+│
 ├── requirements.txt            # Python dependencies
 ├── README.md                   # This file
 └── LICENSE                     # MIT License
@@ -677,25 +684,81 @@ for /d %F in (D:\Media\*) do (
 
 ---
 
-## 🚀 Building Standalone Executable
+## 🚀 Building for Distribution
 
-Convert Renameify to a standalone .exe file (no Python installation required):
+Renameify includes a powerful build system that creates **two distribution versions**:
+
+### Build Versions
+
+1. **Portable Version** (`Renameify.exe`)
+   - Single-file executable with custom icon
+   - No installation required
+   - UPX compressed (~50 MB with compression, ~120 MB without)
+   - Run from anywhere (USB drives, network shares, etc.)
+   - Config stored in `Documents\Renameify\`
+
+2. **Installer Version** (`Renameify-Setup.exe`)
+   - Professional Windows installer with custom icon
+   - Start Menu integration
+   - Desktop shortcut with icon
+   - Uninstaller included
+   - Installs to `Program Files\Renameify\`
+
+### Quick Build
 
 ```bash
-# Install PyInstaller
-pip install pyinstaller
+# Build both versions (recommended)
+build.bat
 
-# Build executable
-pyinstaller --onefile --windowed --name Renameify --icon app.ico Renameify.py
+# Build only portable version (faster)
+build-portable.bat
 
-# Output will be in: dist/Renameify.exe
+# Build only installer version
+build-installer.bat
+
+# Verify what was built
+verify-build.bat
 ```
 
-**Distribution:**
-- Copy `dist/Renameify.exe` to users
-- No Python installation needed
-- Config stored in Documents\Renameify (portable)
-- File size: ~80-120 MB (includes Python runtime)
+### Build Requirements
+
+**Required:**
+- Python 3.10+
+- All dependencies are automatically installed by the build script
+  - Runtime dependencies from `requirements.txt`
+  - PyInstaller for building executables
+  - Pillow for icon conversion
+
+**Optional but recommended:**
+- **UPX Compressor** - Reduces file size by 60% ([download](https://upx.github.io/))
+- **Inno Setup** - Required for installer builds ([download](https://jrsoftware.org/isdl.php))
+
+### Build Output
+
+```
+dist/
+├── portable/
+│   └── Renameify.exe              # Portable version
+│
+└── installer/
+    └── Renameify-2.0.0-Setup.exe  # Windows installer
+```
+
+### Build Features
+
+✅ **Multi-threaded** - Uses all CPU cores for fast compilation
+✅ **Optimized** - Python bytecode optimization level 2
+✅ **Compressed** - UPX compression (optional but recommended)
+✅ **Professional** - Production-ready builds with proper metadata
+✅ **Automated** - Single command builds both versions
+
+### Full Documentation
+
+For complete build instructions, troubleshooting, and advanced options:
+- 📖 [BUILD.md](BUILD.md) - Complete build guide
+- 📖 [BUILD-SCRIPTS.md](BUILD-SCRIPTS.md) - Quick reference for build scripts
+
+**Typical build time:** 3-5 minutes for both versions
 
 ---
 

@@ -50,6 +50,7 @@ except ImportError:
 def extract_season_from_path(file_path: str) -> Optional[int]:
     """
     Extract the season number from a file's folder path.
+    Supports various naming conventions including British "Series X" format.
     """
     if not file_path:
         return None
@@ -78,6 +79,31 @@ def extract_season_from_path(file_path: str) -> Optional[int]:
 
         # Pattern 4: "Show Name Season 2"
         match = re.search(r'\bSeason[\s\.]?(\d{1,2})$', folder_name, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+
+        # Pattern 5: "Series 1", "Series 2" (British TV naming convention)
+        match = re.match(r'^Series\s*(\d{1,2})$', folder_name, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+
+        # Pattern 6: "Show Name Series 2"
+        match = re.search(r'\bSeries\s*(\d{1,2})$', folder_name, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        
+        # Pattern 7: "Staffel X" (German)
+        match = re.match(r'^Staffel\s*(\d{1,2})$', folder_name, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        
+        # Pattern 8: "Temporada X" (Spanish)
+        match = re.match(r'^Temporada\s*(\d{1,2})$', folder_name, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        
+        # Pattern 9: "Saison X" (French)
+        match = re.match(r'^Saison\s*(\d{1,2})$', folder_name, re.IGNORECASE)
         if match:
             return int(match.group(1))
 

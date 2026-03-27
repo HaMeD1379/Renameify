@@ -1308,7 +1308,23 @@ class RenameifyGUI:
             media_files = scan_directory(path, config, progress_callback=scan_cb)
 
             if not media_files:
-                self.msg_queue.put(("done", "No media files found"))
+                mode = config.get("mode", "media")
+                if mode == "mass":
+                    msg = ("No files found in the selected directory.\n\n"
+                           "Possible reasons:\n"
+                           "- Directory is empty or all files are hidden\n"
+                           "- All files are in excluded folders\n"
+                           "- Check your extension filter settings")
+                else:
+                    msg = ("No media files found in the selected directory.\n\n"
+                           "Possible reasons:\n"
+                           "- Directory doesn't contain supported video files\n"
+                           "- All files are in excluded folders\n"
+                           "- Check your video extension settings\n"
+                           "- Try switching to 'Mass Rename' mode for all file types")
+                self.msg_queue.put(("status", ("Complete", 100, "No files found in directory")))
+                self.msg_queue.put(("info", msg))
+                self.msg_queue.put(("done", None))
                 return
 
             # Identify
@@ -1469,6 +1485,9 @@ class RenameifyGUI:
                 elif type_ == "done":
                     self.is_processing = False
                     self.scan_btn.config(state="normal")
+                    # If data contains a message, show it
+                    if data and isinstance(data, str):
+                        messagebox.showinfo("Complete", data)
                 elif type_ == "results":
                     plan, mfiles, minfo = data
                     self.current_plan = plan

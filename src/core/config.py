@@ -151,20 +151,71 @@ DEFAULT_CONFIG = {
 
     # Supported video extensions (for media mode)
     "video_extensions": [
+        # Common video formats
         ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm",
         ".m4v", ".mpg", ".mpeg", ".3gp", ".ts", ".m2ts", ".vob",
-        ".divx", ".xvid", ".asf", ".rm", ".rmvb", ".ogv"
+        ".divx", ".xvid", ".asf", ".rm", ".rmvb", ".ogv",
+        # Additional video formats
+        ".mts", ".m2v", ".mp2", ".mpe", ".mpv", ".m1v",
+        ".f4v", ".f4p", ".f4a", ".f4b",  # Flash video
+        ".3g2", ".3gpp", ".3gpp2",  # Mobile video
+        ".hevc", ".h264", ".h265", ".avc",  # Codec-named
+        ".qt", ".yuv", ".amv", ".mxf", ".roq", ".nsv",
+        ".bik", ".smk",  # Game video formats
+        ".drc", ".gifv", ".mng", ".svi",
+        ".wtv", ".dvr-ms",  # Windows recorded TV
+        ".iso",  # DVD/Blu-ray ISOs (optional, can contain video)
     ],
 
     # Supported audio extensions (for music/audio mode)
     "audio_extensions": [
         ".mp3", ".flac", ".wav", ".aac", ".m4a", ".ogg", ".opus",
         ".wma", ".alac", ".aiff", ".ape", ".dsd", ".dsf", ".dff",
-        ".mpc", ".tak", ".tta", ".wv", ".ac3", ".dts"
+        ".mpc", ".tak", ".tta", ".wv", ".ac3", ".dts",
+        # Additional audio formats
+        ".mid", ".midi", ".kar",  # MIDI
+        ".ra", ".ram",  # RealAudio
+        ".au", ".snd",  # Unix audio
+        ".voc", ".8svx",  # Legacy formats
+        ".cda",  # CD audio track
+        ".mka",  # Matroska audio
+        ".spx",  # Speex
+        ".gsm", ".amr", ".awb",  # Mobile audio
+        ".w64", ".rf64",  # Broadcast Wave
+        ".caf",  # Apple Core Audio
+        ".m4b", ".m4p",  # iTunes formats
     ],
 
     # Subtitle extensions (to rename alongside video files)
-    "subtitle_extensions": [".srt", ".sub", ".ass", ".ssa", ".vtt", ".idx"],
+    "subtitle_extensions": [
+        ".srt", ".sub", ".ass", ".ssa", ".vtt", ".idx",
+        ".smi", ".usf", ".pjs", ".mpl", ".dks",
+        ".stl", ".sbv", ".dfxp", ".ttml",  # Additional formats
+    ],
+
+    # Common document extensions (for mass mode suggestions)
+    "document_extensions": [
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".odt", ".ods", ".odp", ".rtf", ".txt", ".md", ".csv",
+        ".epub", ".mobi", ".azw", ".azw3",  # E-books
+        ".pages", ".numbers", ".key",  # Apple iWork
+        ".tex", ".latex",  # LaTeX
+    ],
+
+    # Common image extensions (for mass mode)
+    "image_extensions": [
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg",
+        ".tiff", ".tif", ".ico", ".heic", ".heif",
+        ".raw", ".cr2", ".nef", ".arw", ".dng",  # RAW formats
+        ".psd", ".ai", ".eps",  # Adobe
+        ".xcf",  # GIMP
+    ],
+
+    # Common archive extensions (for mass mode)
+    "archive_extensions": [
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+        ".cab", ".iso", ".dmg",
+    ],
 
     # Metadata settings
     "show_metadata": True,  # Show metadata info in scan results
