@@ -59,6 +59,34 @@ def is_bdmv_internal_folder(folder_name: str) -> bool:
     return folder_name.lower() in BDMV_INTERNAL_FOLDERS
 
 
+def normalize_extensions(extensions: List[str]) -> set:
+    """
+    Normalize extension entries to canonical '.ext' lowercase format.
+
+    Accepts values like:
+    - ".mkv"
+    - "mkv"
+    - "*.mkv"
+    - " MKV "
+    """
+    normalized = set()
+    for ext in extensions or []:
+        if not ext:
+            continue
+        value = str(ext).strip().lower()
+        if not value:
+            continue
+        if value == "*":
+            normalized.add("*")
+            continue
+        if value.startswith("*."):
+            value = value[1:]  # "*.mkv" -> ".mkv"
+        elif not value.startswith("."):
+            value = f".{value}"  # "mkv" -> ".mkv"
+        normalized.add(value)
+    return normalized
+
+
 def is_excluded(path: Path, config: dict) -> bool:
     """Check if a path should be excluded from scanning."""
     path_str = str(path).lower()
@@ -136,18 +164,22 @@ def scan_directory(
     
     if mode == "mass":
         # Mass rename mode - scan all files or specific extensions
-        mass_extensions = config.get("mass_rename_extensions", ["*"])
+        mass_extensions = normalize_extensions(config.get("mass_rename_extensions", ["*"]))
         if "*" in mass_extensions or not mass_extensions:
             # Scan ALL files - use None to indicate no filtering
             file_extensions = None
         else:
-            file_extensions = set(ext.lower() if ext.startswith('.') else f'.{ext.lower()}' 
-                                 for ext in mass_extensions)
+            file_extensions = mass_extensions
     else:
         # Media mode - only video files
-        file_extensions = set(ext.lower() for ext in config.get("video_extensions", []))
-    
-    subtitle_extensions = set(ext.lower() for ext in config.get("subtitle_extensions", []))
+        file_extensions = normalize_extensions(config.get("video_extensions", []))
+        if not file_extensions:
+            # Fail-safe: do not silently return zero files because of a bad config value.
+            file_extensions = normalize_extensions([
+                ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".webm", ".m4v"
+            ])
+
+    subtitle_extensions = normalize_extensions(config.get("subtitle_extensions", []))
 
     media_files = []
     subtitle_files_found = []  # Track subtitles separately for matching
@@ -434,4 +466,3 @@ def format_scan_results(media_files: List[MediaFile]) -> str:
     lines.append(f"{'='*60}\n")
 
     return "\n".join(lines)
-
