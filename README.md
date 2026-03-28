@@ -40,7 +40,7 @@ Renameify goes beyond simple regex patterns. Using advanced AI models with **liv
 ## 🚀 Quick Start (GUI)
 
 ### Step 1: Download & Extract
-- **[Download Renameify 2.0.0 (Portable EXE)](https://github.com/yourusername/renameify/releases/download/v2.0.0/Renameify_v2.0.0.exe)**
+- **[Download Renameify 2.0.0 (Portable EXE)](https://github.com/HaMeD1379/Renameify/releases/download/v2.0.0/Renameify_v2.0.0.exe)**
 - Extract to any folder (no installation needed!)
 
 ### Step 2: Add API Key
