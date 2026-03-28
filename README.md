@@ -6,7 +6,6 @@
 
 Transform chaotic media libraries into perfectly organized collections with GPT-4o, Claude, or Gemini.
 
-[![GitHub Release](https://img.shields.io/github/v/release/yourusername/renameify?style=flat-square)](https://github.com/yourusername/renameify/releases)
 [![License MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-blue.svg?style=flat-square)]()
