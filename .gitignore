@@ -43,6 +43,8 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+test_*.py
+test_media_folder/
 
 # Virtual environments
 .venv/
@@ -54,6 +56,7 @@ env/
 # IDE
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 *~
@@ -76,9 +79,14 @@ renameify_config.json
 *.pyd
 build/output/
 build/*.spec
+onefile/
 
 # Temporary files
 *.tmp
 *.temp
 *.bak
-/AGENTS.md
+_*.py
+
+# Development documentation
+AGENTS.md
+CLAUDE.md

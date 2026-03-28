@@ -88,18 +88,24 @@ def normalize_extensions(extensions: List[str]) -> set:
 
 
 def is_excluded(path: Path, config: dict) -> bool:
-    """Check if a path should be excluded from scanning."""
+    """Check if a path should be excluded from scanning.
+
+    For excluded_folder_names, only the folder's OWN name is checked -
+    not ancestor path components.  This prevents false exclusions when
+    the user explicitly browses into e.g. a 'Downloads' directory.
+    """
     path_str = str(path).lower()
 
-    # Check excluded paths
+    # Check excluded paths (absolute paths / patterns)
     for excluded in config.get("excluded_paths", []):
         excluded_lower = excluded.lower()
         if excluded_lower in path_str or fnmatch.fnmatch(path_str, excluded_lower):
             return True
 
-    # Check excluded folder names
+    # Check excluded folder names - only match the folder's own name
+    folder_own_name = path.name.lower()
     for folder_name in config.get("excluded_folder_names", []):
-        if folder_name.lower() in path_str.lower().split(os.sep):
+        if folder_name.lower() == folder_own_name:
             return True
 
     return False
@@ -198,9 +204,11 @@ def scan_directory(
         dirs_to_walk = [str(root)]
 
     for scan_root in dirs_to_walk:
+        scan_root_path = Path(scan_root).resolve()
         for dirpath, dirnames, filenames in os.walk(scan_root):
             current_dir = Path(dirpath)
             folders_scanned += 1
+            is_root = current_dir.resolve() == scan_root_path
 
             # Send progress update every 0.1 seconds to avoid slowdown
             current_time = time.time()
@@ -223,8 +231,9 @@ def scan_directory(
                 dirnames.clear()
                 continue
 
-            # Check if current path is excluded
-            if is_excluded(current_dir, config):
+            # Never exclude the scan root itself - the user explicitly chose it.
+            # Only check exclusions on child directories.
+            if not is_root and is_excluded(current_dir, config):
                 skipped_folders.append(str(current_dir))
                 dirnames.clear()
                 continue

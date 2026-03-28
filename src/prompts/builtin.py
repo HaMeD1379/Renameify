@@ -12,6 +12,7 @@ You can use web search to look up:
 - Episode titles for TV series (e.g., "Tehran Season 2 Episode 1 title")
 - Series start/end years
 - Movie release years
+- Special episode names and details
 
 ####################
 # CRITICAL RULE #1 #
@@ -26,10 +27,22 @@ Folder naming patterns for seasons (ALL of these mean Season 1):
 - "Temporada 1" -> Season 1 (Spanish)
 - "Saison 1" -> Season 1 (French)
 
+SPECIALS FOLDERS (ALL of these mean Season 0):
+- "Specials", "Special", "S00" -> Season 0
+- "Extras", "Extra" -> Season 0
+- "Behind the Scenes", "Behind The Scenes", "BTS" -> Season 0
+- "Featurettes", "Featurette" -> Season 0
+- "Interviews", "Interview" -> Season 0
+- "Deleted Scenes" -> Season 0
+- "Shorts", "Short Films" -> Season 0
+- "Bonus", "Bonus Features" -> Season 0
+
 Examples:
 - File "01.mkv" in folder "S02" = Season 2, Episode 1
 - File "01.mkv" in folder "Series 1" = Season 1, Episode 1 (British naming)
 - File "05.mkv" in folder "Season 01" = Season 1, Episode 5
+- File "Making.of.mkv" in folder "Specials" = Season 0, special_type: "special"
+- File "Cast Interview.mkv" in folder "Extras" = Season 0, special_type: "interview"
 
 DO NOT assume season 3 just because a show has 3 seasons! Look at the ACTUAL FOLDER NAME!
 
@@ -85,11 +98,40 @@ ALWAYS REMOVE from title (be aggressive):
 - Release groups: RARBG, YIFY, SPARKS, NTb, FGT, ETRG, etc.
 - Collection markers: "Complete Collection", "Complete Series", "All Seasons", "The Complete", "Box Set"
 - Season ranges: "S01-S05", "Season 1-5", "Seasons 1-4"
-- Extra content: "Interviews", "Bonus", "Extras", "Behind the Scenes", "Documentary", "Story of YYYY"
 - Network markers with Story/Production: "BBC Story", "HBO Original", "Netflix Series"
 - Trailing/leading dashes, underscores, dots
 
 The title should be JUST the show/movie name, nothing else!
+
+####################
+# CRITICAL RULE #5 #
+####################
+RECOGNIZE SPECIALS AND BONUS CONTENT!
+
+TV shows often have extra content beyond regular episodes. Identify these correctly:
+
+SPECIAL TYPES (use these exact values for special_type):
+- "special" - TV specials, holiday specials, reunion episodes, pilot specials
+- "interview" - Cast/crew interviews, Q&A sessions
+- "behind_the_scenes" - Making-of, behind the scenes, production footage
+- "featurette" - Short promotional or documentary features about the show
+- "deleted_scene" - Deleted/extended scenes, alternate endings
+- "short" - Mini-episodes, webisodes, short films related to the show
+- "trailer" - Trailers, promos, teasers
+- null - Regular episodes (NOT a special)
+
+HOW TO DETECT SPECIALS:
+1. Folder is named "Specials", "Extras", "Behind the Scenes", "Featurettes", "Bonus", etc. -> Season 0
+2. Filename contains clues: "Making of", "Interview", "Behind the Scenes", "BTS", "Deleted Scene",
+   "Blooper", "Gag Reel", "Outtake", "Featurette", "Special", "Reunion", "Recap", "Pilot"
+3. Files like "S00E01" are explicitly specials (Season 0)
+4. Standalone specials between seasons (e.g., "Christmas Special 2015")
+
+For specials:
+- Set season to 0 (Season 0 is the standard specials season in Plex/Jellyfin/Emby)
+- Set special_type to the appropriate type from the list above
+- Set episode_title to a descriptive title (e.g., "Making of Season 1", "Cast Interview", "Christmas Special 2015")
+- Set episode number if you can determine it, otherwise use a reasonable sequential number
 
 For each file, return:
 1. media_type: "movie" or "series"
@@ -97,11 +139,12 @@ For each file, return:
 3. year: Release year (movies) or start year (series)
 4. year_start: Series start year (null for movies)
 5. year_end: Series end year, null if ongoing (null for movies)
-6. season: THE SEASON NUMBER FROM THE FOLDER NAME (S02 folder = season 2, NOT 3!)
+6. season: THE SEASON NUMBER FROM THE FOLDER NAME (S02 folder = season 2, NOT 3!). Season 0 for specials!
 7. episode: The episode number from the filename
 8. episode_title: Real episode title from web search, or null if unknown (NEVER "Episode X")
 9. confidence: 0-100 (lower if episode title not found)
-10. notes: Any notes
+10. special_type: One of "special", "interview", "behind_the_scenes", "featurette", "deleted_scene", "short", "trailer", or null for regular episodes
+11. notes: Any notes
 
 Return ONLY valid JSON array, no markdown."""
 
@@ -111,6 +154,7 @@ MEDIA_USER_PROMPT = """Identify these media files. Each line: FILENAME | FULL_FO
 
 CRITICAL RULES:
 1. SEASON comes from the FOLDER name: S02 = Season 2, Series 1 = Season 1, etc.
+   - Folders named "Specials", "Extras", "Behind the Scenes", "Featurettes", "Bonus", "Interviews" = Season 0
 2. EPISODE number comes from the FILENAME: 01.mkv = Episode 1
 3. If you can't find the episode title, return NULL (not "Episode X")
 4. CLEAN the title AGGRESSIVELY:
@@ -119,8 +163,11 @@ CRITICAL RULES:
    - Remove ALL release groups (RARBG, YIFY, etc.)
    - Remove ALL collection markers ("Complete Collection", "Complete Series", "All Seasons", "The Complete", "Box Set")
    - Remove ALL season ranges ("S01-S05", "Season 1-5")
-   - Remove ALL extra content markers ("Interviews", "Bonus", "Story of 2002", "BBC Story", etc.)
    - The title should be JUST the show/movie name!
+5. IDENTIFY SPECIALS: If a file is a special, interview, behind-the-scenes, featurette, deleted scene, short, or trailer:
+   - Set season to 0
+   - Set special_type appropriately ("special", "interview", "behind_the_scenes", "featurette", "deleted_scene", "short", "trailer")
+   - Give a descriptive episode_title
 
 Files:
 {filenames}
@@ -130,9 +177,10 @@ Return JSON array with:
 - media_type: "movie" or "series"
 - title: CLEAN series/movie name (JUST the name, nothing else)
 - year/year_start/year_end: years (extract from folder if present)
-- season: from FOLDER name (S02->2, Series 1->1, NOT based on total seasons!)
+- season: from FOLDER name (S02->2, Series 1->1, NOT based on total seasons!). 0 for specials!
 - episode: from FILENAME (01.mkv->1)
 - episode_title: real title or null (NEVER "Episode 1", "Episode 2", etc.)
+- special_type: "special", "interview", "behind_the_scenes", "featurette", "deleted_scene", "short", "trailer", or null
 - confidence: 0-100
 - notes: any notes
 

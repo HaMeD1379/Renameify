@@ -156,8 +156,25 @@ BDMV_MARKERS = ['index.bdmv', 'movieobject.bdmv', 'bdmv', 'certificate']
 BDMV_INTERNAL_FOLDERS = ['bdmv', 'certificate', 'backup', 'playlist', 'clipinf', 'stream', 'auxdata', 'meta', 'jar']
 
 
+# Folder names that are legitimate specials/extras folders, not scene-release junk
+SPECIALS_FOLDER_NAMES = {
+    "specials", "special", "s00",
+    "extras", "extra",
+    "behind the scenes", "behind_the_scenes", "bts",
+    "featurettes", "featurette",
+    "interviews", "interview",
+    "deleted scenes", "deleted_scenes",
+    "shorts", "short films",
+    "bonus", "bonus features",
+}
+
+
 def is_scene_release_folder(folder_name: str) -> bool:
     """Check if a folder name looks like a scene-release name that needs cleanup."""
+    # Don't flag legitimate specials/extras folders
+    if folder_name.lower().strip() in SPECIALS_FOLDER_NAMES:
+        return False
+
     for pattern in SCENE_FOLDER_PATTERNS:
         if re.search(pattern, folder_name, re.IGNORECASE):
             return True
@@ -250,7 +267,21 @@ def normalize_season_folder_name(folder_name: str) -> Optional[str]:
     Returns None if the folder doesn't appear to be a season folder.
     """
     folder_lower = folder_name.lower().strip()
-    
+
+    # Specials/extras folders -> "Specials" (must check BEFORE numeric patterns catch S00)
+    specials_names = {
+        "specials", "special", "s00",
+        "extras", "extra",
+        "behind the scenes", "behind_the_scenes", "bts",
+        "featurettes", "featurette",
+        "interviews", "interview",
+        "deleted scenes", "deleted_scenes",
+        "shorts", "short films",
+        "bonus", "bonus features",
+    }
+    if folder_lower in specials_names:
+        return "Specials"
+
     # Pattern: "Series X" or "Series XX" (British TV style)
     match = re.match(r'^series\s*(\d{1,2})$', folder_lower, re.IGNORECASE)
     if match:
@@ -286,7 +317,7 @@ def normalize_season_folder_name(folder_name: str) -> Optional[str]:
     if match:
         season_num = int(match.group(1))
         return f"Season {season_num:02d}"
-    
+
     return None
 
 
@@ -581,10 +612,54 @@ def generate_rename_plan(
         config = load_config()
 
     threshold = config.get("confidence_threshold", 80)
-    restructure = config.get("restructure_folders", True)
 
-    # Create lookup by original filename
-    info_lookup = {info.original_filename: info for info in media_infos}
+    # Create multiple lookup strategies for matching LLM results to scanned files
+    info_lookup = {}  # exact original_filename -> MediaInfo
+    info_by_path = {}  # original_path -> MediaInfo
+    info_by_stem = {}  # lowercase stem -> MediaInfo
+    info_by_norm = {}  # normalized name -> MediaInfo
+
+    for info in media_infos:
+        info_lookup[info.original_filename] = info
+        if info.original_path:
+            info_by_path[info.original_path] = info
+        # Store by stem (strip extension from what the LLM returned)
+        stem = re.sub(r'\.[^.]+$', '', info.original_filename).lower()
+        info_by_stem[stem] = info
+        # Normalized: collapse separators
+        norm = re.sub(r'[\.\-_]+', ' ', stem).strip()
+        info_by_norm[norm] = info
+
+    def _find_info(media_file):
+        """Try multiple strategies to find the MediaInfo for a MediaFile."""
+        fn = media_file.filename  # stem, no extension
+        fn_with_ext = fn + media_file.extension
+
+        # 1. Exact match on filename with extension (what we now send to LLM)
+        if fn_with_ext in info_lookup:
+            return info_lookup[fn_with_ext]
+        # 2. Exact match on stem only
+        if fn in info_lookup:
+            return info_lookup[fn]
+        # 3. Match by full path
+        path_str = str(media_file.path)
+        if path_str in info_by_path:
+            return info_by_path[path_str]
+        # 4. Case-insensitive stem match
+        fn_lower = fn.lower()
+        if fn_lower in info_by_stem:
+            return info_by_stem[fn_lower]
+        # 5. Normalized match
+        fn_norm = re.sub(r'[\.\-_]+', ' ', fn_lower).strip()
+        if fn_norm in info_by_norm:
+            return info_by_norm[fn_norm]
+        # 6. Substring / fuzzy containment
+        for key, info in info_lookup.items():
+            key_lower = key.lower()
+            key_stem = re.sub(r'\.[^.]+$', '', key_lower)
+            if fn_lower == key_stem or fn_lower in key_lower or key_stem in fn_lower:
+                return info
+        return None
 
     plan_items = []
     high_confidence = []
@@ -593,7 +668,7 @@ def generate_rename_plan(
     skipped = []
 
     for media_file in media_files:
-        info = info_lookup.get(media_file.filename)
+        info = _find_info(media_file)
 
         if not info:
             # No GPT info found, skip
@@ -638,39 +713,9 @@ def generate_rename_plan(
         new_filename = sanitize_filename(format_media_info(info, config))
         new_filename_with_ext = new_filename + media_file.extension
 
-        # Determine new path
-        if restructure and info.media_type != "unknown":
-            # Get folder structure (e.g., "Series Name [Year]/Season XX")
-            folder_structure = format_folder_structure(info, config)
-
-            # Check if root_path already contains the series folder
-            # This prevents duplication like "Series [Year]/Series [Year]/Season XX"
-            root_name = Path(root_path).name
-            folder_parts = folder_structure.split("/")
-
-            if len(folder_parts) >= 1:
-                series_folder = folder_parts[0]  # e.g., "Money Heist [2017-2021]"
-
-                # Check if root folder name matches or contains the series name
-                # Match cases like: root="Money Heist [2017-2021]" and series_folder="Money Heist [2017-2021]"
-                if root_name == series_folder or root_name.startswith(info.title):
-                    # Root is already the series folder, only use season folder
-                    if len(folder_parts) > 1:
-                        folder_structure = "/".join(folder_parts[1:])  # Just "Season XX"
-                    else:
-                        folder_structure = ""  # No subfolder needed
-
-            folder_structure = sanitize_filename(folder_structure.replace("/", os.sep))
-
-            # Build new path under root
-            if folder_structure:
-                new_dir = Path(root_path) / folder_structure
-            else:
-                new_dir = Path(root_path)
-            new_path = new_dir / new_filename_with_ext
-        else:
-            # Keep in same directory
-            new_path = media_file.path.parent / new_filename_with_ext
+        # Files are always renamed in-place (same directory).
+        # Folder structure changes are handled separately via folder_renames.
+        new_path = media_file.path.parent / new_filename_with_ext
 
         # Check if already correctly named (exact path match)
         if str(media_file.path) == str(new_path):
@@ -688,11 +733,8 @@ def generate_rename_plan(
                 lang_suffix = f".{sub.language}" if sub.language else ""
                 new_sub_filename = f"{new_filename}{lang_suffix}{sub.extension}"
 
-                # Determine subtitle new path
-                if restructure and info.media_type != "unknown":
-                    new_sub_path = new_dir / new_sub_filename
-                else:
-                    new_sub_path = media_file.path.parent / new_sub_filename
+                # Subtitles are renamed in-place alongside the video file
+                new_sub_path = media_file.path.parent / new_sub_filename
 
                 if str(sub.path) != str(new_sub_path):
                     subtitle_operations.append({
@@ -712,6 +754,7 @@ def generate_rename_plan(
             "episode": info.episode,
             "confidence": info.confidence,
             "notes": info.notes,
+            "special_type": getattr(info, 'special_type', None),
             "subtitles": subtitle_operations  # Include subtitle operations
         }
 

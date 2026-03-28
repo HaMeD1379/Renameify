@@ -120,7 +120,7 @@ DEFAULT_CONFIG = {
     "openrouter_api_key": "",
 
     # Model selection
-    "openai_model": "gpt-4o-mini",
+    "openai_model": "gpt-4o",
     "anthropic_model": "claude-sonnet-4-20250514",
     "google_model": "gemini-2.0-flash",
     "openrouter_model": "openai/gpt-4o-mini",
@@ -261,11 +261,14 @@ DEFAULT_CONFIG = {
     # Enable folder restructuring
     "restructure_folders": True,
 
+    # Enable folder renaming (clean scene-release names, normalize season folders)
+    "rename_folders": True,
+
     # Rename subtitles alongside video files
     "rename_subtitles": True,
 
-    # Batch size for GPT API calls
-    "gpt_batch_size": 25,
+    # Batch size for GPT API calls (smaller = more reliable with web search)
+    "gpt_batch_size": 15,
 
     # Number of parallel GPT workers
     "gpt_parallel_workers": 3,

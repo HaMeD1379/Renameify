@@ -478,13 +478,16 @@ class RenameifyGUI:
         self.platform_var = tk.StringVar(value=PLATFORM_GENERIC)
         self.mode_var = tk.StringVar(value="media")  # media or mass
         self.custom_prompt_enabled = tk.BooleanVar(value=False)
+        self.rename_folders_var = tk.BooleanVar(value=True)
 
         # State
         self.current_plan = None
         self.media_files = []
         self.media_info = []
+        self.scan_path = ""
         self.is_processing = False
         self.selection_state = {}
+        self.folder_rename_items = {}  # item_id -> index in current_plan.folder_renames
 
         # Message queue
         self.msg_queue = queue.Queue()
@@ -633,6 +636,12 @@ class RenameifyGUI:
             action_frame,
             text="Include Low Confidence",
             variable=self.include_low_var
+        ).pack(side="left", padx=(10, 0))
+
+        ttk.Checkbutton(
+            action_frame,
+            text="Rename Folders",
+            variable=self.rename_folders_var
         ).pack(side="left", padx=(10, 0))
 
         ttk.Button(action_frame, text="Clear Results", command=self._clear_results).pack(side="right")
@@ -913,6 +922,7 @@ class RenameifyGUI:
             config = load_config()
             self.smart_filter_var.set(config.get("smart_folder_filter", True))
             self.restructure_var.set(config.get("restructure_folders", True))
+            self.rename_folders_var.set(config.get("rename_folders", True))
             self.conf_var.set(config.get("confidence_threshold", 80))
             self.batch_var.set(config.get("gpt_batch_size", 25))
 
@@ -1033,6 +1043,125 @@ class RenameifyGUI:
         if path:
             normalized = os.path.normpath(path)
             self.current_path.set(normalized)
+            # Immediately discover files and show preview
+            self._start_browse(normalized)
+
+    def _start_browse(self, path):
+        """Start file discovery for the selected directory (no API calls)."""
+        if not os.path.isdir(path):
+            messagebox.showerror("Error", "Invalid Directory")
+            return
+
+        if self.is_processing:
+            return
+        self.is_processing = True
+        self.scan_btn.config(state="disabled")
+        self._clear_results()
+
+        add_recent_path(path)
+        self.path_combo['values'] = get_recent_paths()
+
+        threading.Thread(target=self._browse_thread, args=(path,), daemon=True).start()
+
+    def _browse_thread(self, path):
+        """Discover files in the directory without calling any API."""
+        try:
+            config = load_config()
+
+            # Phase 1: Smart folder filtering (heuristics only, no GPT)
+            self.msg_queue.put(("status", ("Browsing...", 10, "Finding files...")))
+            folders_to_scan = None
+
+            if self.smart_filter_var.get():
+                self.msg_queue.put(("status", ("Browsing...", 10, "Smart filtering folders...")))
+
+                def filter_cb(msg: str):
+                    self.msg_queue.put(("status", ("Browsing...", 10, msg)))
+
+                # Never use GPT during browse - keep it independent of API
+                folders_to_scan, _folders_to_skip, classifications = smart_filter_folders(
+                    path,
+                    config=config,
+                    progress_callback=filter_cb,
+                    use_gpt=False
+                )
+
+                if classifications:
+                    report = format_classification_report(classifications)
+                    self.msg_queue.put(("info", report))
+
+                # Safety net: never let filtering hide all files.
+                if not folders_to_scan:
+                    self.msg_queue.put((
+                        "info",
+                        "Smart Folder Filter did not find any target folders.\n"
+                        "Falling back to full directory scan to avoid missing files."
+                    ))
+                    folders_to_scan = None
+
+            # Phase 2: File discovery
+            def scan_cb(p: ScanProgress):
+                pct = 10 + (min(p.files_found, 500) / 500 * 80)  # estimate progress
+                details = f"Found {p.files_found} files in {p.folders_scanned} folders"
+                self.msg_queue.put(("status", ("Browsing...", pct, details)))
+
+            media_files = scan_directory(
+                path,
+                config,
+                progress_callback=scan_cb,
+                folders_to_scan=folders_to_scan
+            )
+
+            if not media_files:
+                mode = config.get("mode", "media")
+                if mode == "mass":
+                    msg = ("No files found in the selected directory.\n\n"
+                           "Possible reasons:\n"
+                           "- Directory is empty or all files are hidden\n"
+                           "- All files are in excluded folders\n"
+                           "- Check your extension filter settings")
+                else:
+                    msg = ("No media files found in the selected directory.\n\n"
+                           "Possible reasons:\n"
+                           "- Directory doesn't contain supported video files\n"
+                           "- All files are in excluded folders\n"
+                           "- Check your video extension settings\n"
+                           "- Try switching to 'Mass Rename' mode for all file types")
+                self.msg_queue.put(("status", ("Complete", 100, "No files found in directory")))
+                self.msg_queue.put(("info", msg))
+                self.msg_queue.put(("done", None))
+                return
+
+            # Show files in preview (no rename info yet)
+            self.msg_queue.put(("preview", (media_files, path)))
+            self.msg_queue.put(("status", (
+                "Ready to Scan",
+                100,
+                f"Found {len(media_files)} files. Click 'Start Scan' to identify and generate rename plan."
+            )))
+
+        except Exception as e:
+            self.msg_queue.put(("error", str(e)))
+        finally:
+            self.msg_queue.put(("done", None))
+
+    def _populate_preview(self, media_files):
+        """Show discovered files in the results tree (before LLM identification)."""
+        self.results_tree.delete(*self.results_tree.get_children())
+        self.selection_state = {}
+
+        for mf in media_files:
+            item_id = self.results_tree.insert("", "end", values=(
+                "-",
+                mf.filename + mf.extension,
+                "(pending scan)",
+                mf.extension,
+                "-"
+            ), tags=("preview",))
+            self.selection_state[item_id] = True
+
+        self.results_tree.tag_configure("preview", foreground="gray")
+        self._update_selection_count()
 
     def _toggle_api_key(self):
         current = self.api_entry.cget("show")
@@ -1074,6 +1203,7 @@ class RenameifyGUI:
             config["llm_provider"] = provider
             config[f"{provider}_model"] = model_id
             config["restructure_folders"] = self.restructure_var.get()
+            config["rename_folders"] = self.rename_folders_var.get()
             config["confidence_threshold"] = self.conf_var.get()
             config["gpt_batch_size"] = self.batch_var.get()
             config["smart_folder_filter"] = self.smart_filter_var.get()
@@ -1143,7 +1273,11 @@ class RenameifyGUI:
     def _clear_results(self):
         self.results_tree.delete(*self.results_tree.get_children())
         self.current_plan = None
+        self.media_files = []
+        self.media_info = []
+        self.scan_path = ""
         self.selection_state = {}
+        self.folder_rename_items = {}
         self.apply_btn.config(state="disabled")
         self.selection_label.config(text="Selected: 0 / 0")
         self.progress_panel.update_progress(0, "Ready", "")
@@ -1272,7 +1406,7 @@ class RenameifyGUI:
         selected = sum(1 for item in all_items if self.selection_state.get(item, True))
         self.selection_label.config(text=f"Selected: {selected} / {len(all_items)}")
 
-    # Scanning
+    # Scanning (LLM identification of already-discovered files)
     def _start_scan(self):
         path = self.current_path.get().strip()
         if not os.path.isdir(path):
@@ -1281,29 +1415,36 @@ class RenameifyGUI:
 
         if self.is_processing:
             return
+
+        # If no files discovered yet, or path changed since last browse, do full scan
+        if not self.media_files or os.path.normpath(path) != os.path.normpath(self.scan_path):
+            self.is_processing = True
+            self.scan_btn.config(state="disabled")
+            self._clear_results()
+            add_recent_path(path)
+            self.path_combo['values'] = get_recent_paths()
+            threading.Thread(target=self._full_scan_thread, args=(path,), daemon=True).start()
+            return
+
+        # Files already discovered - just run LLM identification
         self.is_processing = True
         self.scan_btn.config(state="disabled")
-        self._clear_results()
-
-        add_recent_path(path)
-        self.path_combo['values'] = get_recent_paths()
-
         threading.Thread(target=self._scan_thread, args=(path,), daemon=True).start()
 
-    def _scan_thread(self, path):
+    def _full_scan_thread(self, path):
+        """Full scan: discover files + LLM identification (when user clicks Scan without browsing first)."""
         try:
             config = load_config()
-            custom_prompt = get_custom_prompt() if self.custom_prompt_enabled.get() else None
 
-            # Scan
-            self.msg_queue.put(("status", ("Scanning...", 10, "Finding files...")))
+            # Phase 1: File discovery
+            self.msg_queue.put(("status", ("Scanning...", 5, "Finding files...")))
             folders_to_scan = None
 
             if self.smart_filter_var.get():
-                self.msg_queue.put(("status", ("Scanning...", 10, "Smart filtering folders...")))
+                self.msg_queue.put(("status", ("Scanning...", 5, "Smart filtering folders...")))
 
                 def filter_cb(msg: str):
-                    self.msg_queue.put(("status", ("Scanning...", 10, msg)))
+                    self.msg_queue.put(("status", ("Scanning...", 5, msg)))
 
                 use_gpt = bool(get_api_key())
                 folders_to_scan, _folders_to_skip, classifications = smart_filter_folders(
@@ -1317,7 +1458,6 @@ class RenameifyGUI:
                     report = format_classification_report(classifications)
                     self.msg_queue.put(("info", report))
 
-                # Safety net: never let filtering hide all files.
                 if not folders_to_scan:
                     self.msg_queue.put((
                         "info",
@@ -1357,38 +1497,56 @@ class RenameifyGUI:
                 self.msg_queue.put(("done", None))
                 return
 
-            # Identify
-            self.msg_queue.put(("status", ("Identifying...", 20, f"Identifying {len(media_files)} files...")))
-
-            def gpt_cb(p: GPTProgress):
-                pct = 20 + (p.files_processed / p.total_files * 70)
-                eta = f"{p.estimated_remaining:.0f}s" if p.estimated_remaining else "?"
-                details = f"Processed {p.files_processed}/{p.total_files} | ETA: {eta}"
-                self.msg_queue.put(("status", ("Identifying...", pct, details)))
-
-            filenames_with_paths = [(f.filename, str(f.path)) for f in media_files]
-            media_info = identify_all_media(
-                filenames_with_paths,
-                config,
-                progress_callback=gpt_cb,
-                custom_prompt=custom_prompt
-            )
-
-            # Generate plan
-            self.msg_queue.put(("status", ("Planning...", 95, "Generating rename plan...")))
-            plan = generate_rename_plan(media_files, media_info, path, config)
-
-            self.msg_queue.put(("results", (plan, media_files, media_info)))
-            self.msg_queue.put(("status", (
-                "Complete",
-                100,
-                f"Plan ready: {len(plan.high_confidence) + len(plan.low_confidence)} renames"
-            )))
+            # Store discovered files and run identification
+            self.msg_queue.put(("store_files", (media_files, path)))
+            self._run_llm_identification(media_files, path)
 
         except Exception as e:
             self.msg_queue.put(("error", str(e)))
         finally:
             self.msg_queue.put(("done", None))
+
+    def _scan_thread(self, path):
+        """Run LLM identification on already-discovered files."""
+        try:
+            self._run_llm_identification(self.media_files, path)
+        except Exception as e:
+            self.msg_queue.put(("error", str(e)))
+        finally:
+            self.msg_queue.put(("done", None))
+
+    def _run_llm_identification(self, media_files, path):
+        """Run LLM identification and plan generation on discovered files."""
+        config = load_config()
+        custom_prompt = get_custom_prompt() if self.custom_prompt_enabled.get() else None
+
+        # Identify
+        self.msg_queue.put(("status", ("Identifying...", 20, f"Identifying {len(media_files)} files...")))
+
+        def gpt_cb(p: GPTProgress):
+            pct = 20 + (p.files_processed / p.total_files * 70)
+            eta = f"{p.estimated_remaining:.0f}s" if p.estimated_remaining else "?"
+            details = f"Processed {p.files_processed}/{p.total_files} | ETA: {eta}"
+            self.msg_queue.put(("status", ("Identifying...", pct, details)))
+
+        filenames_with_paths = [(f.filename + f.extension, str(f.path)) for f in media_files]
+        media_info = identify_all_media(
+            filenames_with_paths,
+            config,
+            progress_callback=gpt_cb,
+            custom_prompt=custom_prompt
+        )
+
+        # Generate plan
+        self.msg_queue.put(("status", ("Planning...", 95, "Generating rename plan...")))
+        plan = generate_rename_plan(media_files, media_info, path, config)
+
+        self.msg_queue.put(("results", (plan, media_files, media_info)))
+        self.msg_queue.put(("status", (
+            "Complete",
+            100,
+            f"Plan ready: {len(plan.high_confidence) + len(plan.low_confidence)} renames"
+        )))
 
     def _apply_renames(self):
         if not self.current_plan:
@@ -1436,11 +1594,21 @@ class RenameifyGUI:
             filtered_manifest = self.current_plan.manifest
             filtered_manifest.operations = selected_operations
 
+            # Only apply folder renames when enabled and selected in the tree
+            if self.rename_folders_var.get():
+                selected_folder_renames = [
+                    self.current_plan.folder_renames[idx]
+                    for item_id, idx in self.folder_rename_items.items()
+                    if self.selection_state.get(item_id, True)
+                ]
+            else:
+                selected_folder_renames = []
+
             success, failed, errs = execute_rename_plan(
                 filtered_manifest,
                 include_low_confidence=include_low,
                 config=config,
-                folder_renames=self.current_plan.folder_renames
+                folder_renames=selected_folder_renames
             )
 
             msg = f"Applied: {success} success, {failed} failed"
@@ -1518,6 +1686,16 @@ class RenameifyGUI:
                     # If data contains a message, show it
                     if data and isinstance(data, str):
                         messagebox.showinfo("Complete", data)
+                elif type_ == "preview":
+                    mfiles, scan_path = data
+                    self.media_files = mfiles
+                    self.scan_path = scan_path
+                    self._populate_preview(mfiles)
+                    self.scan_btn.config(state="normal")
+                elif type_ == "store_files":
+                    mfiles, scan_path = data
+                    self.media_files = mfiles
+                    self.scan_path = scan_path
                 elif type_ == "results":
                     plan, mfiles, minfo = data
                     self.current_plan = plan
@@ -1539,29 +1717,36 @@ class RenameifyGUI:
     def _populate_results(self, plan):
         self.results_tree.delete(*self.results_tree.get_children())
         self.selection_state = {}
+        self.folder_rename_items = {}
 
         for r in plan.high_confidence:
+            type_label = r.get('media_type', '?')
+            if r.get('special_type'):
+                type_label = r['special_type'].replace('_', ' ')
             item_id = self.results_tree.insert("", "end", values=(
                 "Y",
                 Path(r['original_path']).name,
                 Path(r['new_path']).name,
-                r.get('media_type', '?'),
+                type_label,
                 f"{r.get('confidence', 0)}%"
             ), tags=("high",))
             self.selection_state[item_id] = True
 
         for r in plan.low_confidence:
+            type_label = r.get('media_type', '?')
+            if r.get('special_type'):
+                type_label = r['special_type'].replace('_', ' ')
             item_id = self.results_tree.insert("", "end", values=(
                 "Y",
                 Path(r['original_path']).name,
                 Path(r['new_path']).name,
-                r.get('media_type', '?'),
+                type_label,
                 f"{r.get('confidence', 0)}%"
             ), tags=("low",))
             self.selection_state[item_id] = True
 
-        if plan.folder_renames:
-            for r in plan.folder_renames:
+        if plan.folder_renames and self.rename_folders_var.get():
+            for i, r in enumerate(plan.folder_renames):
                 item_id = self.results_tree.insert("", "end", values=(
                     "Y",
                     r.get('original_name', '?'),
@@ -1570,6 +1755,7 @@ class RenameifyGUI:
                     "-"
                 ), tags=("folder",))
                 self.selection_state[item_id] = True
+                self.folder_rename_items[item_id] = i
 
         self.results_tree.tag_configure("high", foreground="green")
         self.results_tree.tag_configure("low", foreground="orange")
