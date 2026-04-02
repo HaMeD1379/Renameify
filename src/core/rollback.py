@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict
 
-from .config import load_config, get_logs_dir as get_config_logs_dir
+from .config import get_logs_dir as get_config_logs_dir
 
 
 @dataclass
@@ -39,13 +39,17 @@ class RenameManifest:
 
 
 def get_logs_dir(config: Optional[dict] = None) -> Path:
-    """Get the logs directory path."""
-    if config is None:
-        config = load_config()
+    """Get the logs directory path.
 
-    logs_dir = Path(config.get("logs_dir", "rename_logs"))
-    if not logs_dir.is_absolute():
-        logs_dir = Path(__file__).parent / logs_dir
+    Uses the Documents/Renameify/logs directory by default (from config module),
+    falling back to the config ``logs_dir`` key when explicitly set (e.g. in tests).
+    """
+    if config is not None and "logs_dir" in config:
+        # Explicit override (used by tests)
+        logs_dir = Path(config["logs_dir"])
+    else:
+        # Use the standard Documents/Renameify/logs location
+        logs_dir = get_config_logs_dir()
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     return logs_dir

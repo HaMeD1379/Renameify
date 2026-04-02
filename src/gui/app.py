@@ -8,16 +8,17 @@ Features:
 - Mass rename mode for any files
 - Plex Agent and Scanner options
 - Config stored in Windows Documents folder
+- Stop/cancel support for long operations
+- Refresh button to re-scan without LLM
 """
 import os
-import sys
 import threading
 import queue
 import time
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
-from datetime import datetime
+import json
 
 
 # sys.path is set up by the entry point (Renameify.py) in dev mode,
@@ -26,25 +27,32 @@ from datetime import datetime
 
 from core.config import (
     load_config, save_config, get_api_key, set_api_key,
-    get_config_dir, add_exclusion, remove_exclusion, list_exclusions,
+    get_config_dir,
     set_platform, get_custom_prompt, set_custom_prompt, add_recent_path, get_recent_paths,
     PLATFORM_PLEX, PLATFORM_JELLYFIN, PLATFORM_EMBY, PLATFORM_GENERIC,
-    AVAILABLE_MODELS, get_available_models, get_current_model, set_current_model,
+    get_available_models, get_current_model, set_current_model,
     fetch_available_models, clear_model_cache,
     APP_NAME as _APP_NAME, APP_VERSION as _APP_VERSION,
 )
 from core.scanner import scan_directory, ScanProgress
-from core.gpt_service import identify_all_media, GPTProgress
-from core.renamer import generate_rename_plan, execute_rename_plan, execute_rollback, RenamePlan
+from core.gpt_service import (
+    identify_all_media, GPTProgress,
+    request_cancel, reset_cancel, is_cancelled, bind_cancel_token,
+    test_llm_connection,
+)
+from core.renamer import generate_rename_plan, execute_rename_plan, execute_rollback
 from core.rollback import list_manifests, load_manifest
 from platforms.plex import PLEX_AGENTS, PLEX_SCANNERS
 from utils.folder_filter import smart_filter_folders, format_classification_report
 
 # Try to import metadata module (optional)
 try:
-    from core.metadata import read_metadata, write_metadata, is_mutagen_available, FileMetadata
+    from core.metadata import read_metadata, write_metadata, is_mutagen_available
     METADATA_AVAILABLE = True
 except ImportError:
+    read_metadata = None
+    write_metadata = None
+    is_mutagen_available = lambda: False
     METADATA_AVAILABLE = False
 
 
@@ -53,28 +61,108 @@ APP_VERSION = _APP_VERSION
 
 
 class DetailedProgressPanel(ttk.Frame):
-    """Progress panel with status information."""
+    """Progress panel with animated status information."""
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
 
+        # Top row: progress bar + percentage
+        top_frame = ttk.Frame(self)
+        top_frame.pack(fill="x", pady=(0, 4))
+
         self.progress_var = tk.DoubleVar(value=0)
-        self.bar = ttk.Progressbar(self, variable=self.progress_var, maximum=100, length=400)
-        self.bar.pack(fill="x", pady=(0, 5))
+        self._target_progress = 0.0
+        self._current_progress = 0.0
+        self.bar = ttk.Progressbar(top_frame, variable=self.progress_var, maximum=100, length=400)
+        self.bar.pack(side="left", fill="x", expand=True)
+
+        self.pct_var = tk.StringVar(value="")
+        ttk.Label(top_frame, textvariable=self.pct_var, width=6, anchor="e",
+                  font=("Segoe UI", 9)).pack(side="right", padx=(6, 0))
+
+        # Status row
+        status_frame = ttk.Frame(self)
+        status_frame.pack(fill="x")
 
         self.status_var = tk.StringVar(value="Ready")
-        self.status_label = ttk.Label(self, textvariable=self.status_var, font=("Segoe UI", 10, "bold"))
-        self.status_label.pack(anchor="w")
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var,
+                                       font=("Segoe UI", 10, "bold"))
+        self.status_label.pack(side="left")
 
+        self.elapsed_var = tk.StringVar(value="")
+        ttk.Label(status_frame, textvariable=self.elapsed_var,
+                  font=("Segoe UI", 9), foreground="gray").pack(side="right")
+
+        # Detail row
         self.detail_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.detail_var, font=("Consolas", 9)).pack(anchor="w")
+        ttk.Label(self, textvariable=self.detail_var,
+                  font=("Consolas", 9)).pack(anchor="w")
+
+        self._start_time = None
+        self._animating = False
 
     def update_progress(self, percent: float, status: str = None, details: str = None):
-        self.progress_var.set(percent)
+        self._target_progress = max(0.0, min(100.0, percent))
         if status:
             self.status_var.set(status)
         if details:
             self.detail_var.set(details)
+
+        # Show percentage
+        if self._target_progress > 0:
+            self.pct_var.set(f"{self._target_progress:.0f}%")
+        else:
+            self.pct_var.set("")
+
+        # Start elapsed timer on first non-zero update
+        if self._target_progress > 0 and self._start_time is None:
+            self._start_time = time.time()
+
+        # Reset timer when back to 0
+        if self._target_progress == 0:
+            self._start_time = None
+            self.elapsed_var.set("")
+
+        # Update elapsed time display
+        if self._start_time is not None:
+            elapsed = time.time() - self._start_time
+            mins, secs = divmod(int(elapsed), 60)
+            self.elapsed_var.set(f"Elapsed: {mins}:{secs:02d}")
+
+        # Start smooth animation
+        if not self._animating:
+            self._animating = True
+            self._animate_progress()
+
+    def _animate_progress(self):
+        """Smoothly animate the progress bar toward the target."""
+        diff = self._target_progress - self._current_progress
+        if abs(diff) < 0.5:
+            self._current_progress = self._target_progress
+            self.progress_var.set(self._current_progress)
+            self._animating = False
+            return
+
+        # Move 20% of remaining distance each frame
+        step = diff * 0.2
+        if abs(step) < 0.3:
+            step = 0.3 if diff > 0 else -0.3
+        self._current_progress += step
+        self.progress_var.set(self._current_progress)
+
+        self.after(30, lambda: self._animate_progress())
+
+    def reset(self):
+        """Reset progress to initial state."""
+        self._target_progress = 0.0
+        self._current_progress = 0.0
+        self._start_time = None
+        self.progress_var.set(0)
+        self.status_var.set("Ready")
+        self.detail_var.set("")
+        self.pct_var.set("")
+        self.elapsed_var.set("")
+        self._animating = False
 
 
 class CustomPromptDialog(tk.Toplevel):
@@ -464,11 +552,46 @@ class MetadataDialog(tk.Toplevel):
 class RenameifyGUI:
     """Main GUI application for Renameify."""
 
+    COLORS = {
+        "bg": "#f4f7fb",
+        "panel": "#ffffff",
+        "hero": "#172033",
+        "hero_muted": "#b8c3da",
+        "accent": "#4f7cff",
+        "accent_hover": "#4166d5",
+        "success": "#1f9d72",
+        "success_hover": "#18815e",
+        "danger": "#d64545",
+        "danger_hover": "#b73737",
+        "warning": "#f2a93b",
+        "text": "#1f2937",
+        "muted": "#6b7280",
+        "border": "#d7deeb",
+    }
+
+    # Maps for provider display <-> internal names
+    PROVIDER_TO_DISPLAY = {
+        "openai": "OpenAI",
+        "anthropic": "Anthropic (Claude)",
+        "google": "Google (Gemini)",
+        "openrouter": "OpenRouter"
+    }
+    DISPLAY_TO_PROVIDER = {v: k for k, v in PROVIDER_TO_DISPLAY.items()}
+
+    PLATFORM_TO_DISPLAY = {
+        PLATFORM_GENERIC: "Generic",
+        PLATFORM_PLEX: "Plex",
+        PLATFORM_JELLYFIN: "Jellyfin",
+        PLATFORM_EMBY: "Emby"
+    }
+    DISPLAY_TO_PLATFORM = {v: k for k, v in PLATFORM_TO_DISPLAY.items()}
+
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_NAME} - AI-Powered File Renaming")
         self.root.geometry("1200x850")
         self.root.minsize(1000, 750)
+        self.root.configure(bg=self.COLORS["bg"])
 
         # Variables
         self.current_path = tk.StringVar()
@@ -488,59 +611,172 @@ class RenameifyGUI:
         self.is_processing = False
         self.selection_state = {}
         self.folder_rename_items = {}  # item_id -> index in current_plan.folder_renames
+        self._operation_counter = 0
+        self._active_operation_id = None
+        self._operation_cancel_tokens = {}
+        self._stale_operation_ids = set()
+        self._active_operation_can_stop = False
 
         # Message queue
         self.msg_queue = queue.Queue()
 
-        # Create UI
+        # Create UI – style failures must not prevent the app from starting
+        try:
+            self._configure_styles()
+        except Exception:
+            pass  # fall back to default theme
         self._create_ui()
         self._load_config()
 
         # Start message processor
         self.root.after(100, self._process_messages)
 
+        # Save config on close
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        """Save state before closing."""
+        try:
+            self._save_all_settings_silent()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    def _save_all_settings_silent(self):
+        """Save all current UI settings to config without showing messages."""
+        config = load_config()
+
+        # Provider and model
+        provider = self.DISPLAY_TO_PROVIDER.get(self.provider_var.get(), "openai")
+        model_display = self.model_var.get()
+        model_id = model_display.split(" - ")[0] if " - " in model_display else model_display
+
+        config["llm_provider"] = provider
+        if model_id:
+            config[f"{provider}_model"] = model_id
+        config["restructure_folders"] = self.restructure_var.get()
+        config["rename_folders"] = self.rename_folders_var.get()
+        config["confidence_threshold"] = self.conf_var.get()
+        config["gpt_batch_size"] = self.batch_var.get()
+        config["smart_folder_filter"] = self.smart_filter_var.get()
+        config["mode"] = self.mode_var.get()
+
+        # Platform
+        platform = self.DISPLAY_TO_PLATFORM.get(self.platform_var.get(), PLATFORM_GENERIC)
+        config["platform"] = platform
+
+        # Last path
+        path = self.current_path.get().strip()
+        if path:
+            config["last_path"] = path
+
+        # Window geometry
+        config["window_geometry"] = self.root.geometry()
+
+        save_config(config)
+
+    def _configure_styles(self):
+        """Apply a more polished ttk look-and-feel to the app."""
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.root.option_add("*Font", "{Segoe UI} 10")
+
+        style.configure(".", background=self.COLORS["bg"], foreground=self.COLORS["text"])
+        style.configure("TFrame", background=self.COLORS["bg"])
+        style.configure("Card.TFrame", background=self.COLORS["panel"])
+        style.configure("TLabelframe", background=self.COLORS["panel"], borderwidth=1, relief="solid")
+        style.configure("TLabelframe.Label", background=self.COLORS["panel"], foreground=self.COLORS["text"], font=("Segoe UI", 10, "bold"))
+        style.configure("TLabel", background=self.COLORS["bg"], foreground=self.COLORS["text"])
+        style.configure("Hero.TFrame", background=self.COLORS["hero"])
+        style.configure("Muted.TLabel", background=self.COLORS["bg"], foreground=self.COLORS["muted"])
+        style.configure("HeroTitle.TLabel", background=self.COLORS["hero"], foreground="white", font=("Segoe UI", 20, "bold"))
+        style.configure("HeroSub.TLabel", background=self.COLORS["hero"], foreground=self.COLORS["hero_muted"], font=("Segoe UI", 10))
+        style.configure("Hero.TRadiobutton", background=self.COLORS["hero"], foreground="white")
+        style.map("Hero.TRadiobutton", background=[("active", self.COLORS["hero"])], foreground=[("active", "white")])
+        style.configure("StatusBadge.TLabel", background=self.COLORS["accent"], foreground="white", padding=(10, 4), font=("Segoe UI", 9, "bold"))
+
+        style.configure("TNotebook", background=self.COLORS["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(16, 8), font=("Segoe UI", 10, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", self.COLORS["panel"]), ("active", "#e9eefc")])
+
+        style.configure("TButton", padding=(10, 6), relief="flat")
+        style.configure("Accent.TButton", background=self.COLORS["accent"], foreground="white", font=("Segoe UI", 10, "bold"), borderwidth=0)
+        style.map("Accent.TButton", background=[("active", self.COLORS["accent_hover"]), ("disabled", "#b8c3da")], foreground=[("disabled", "#eef2ff")])
+        style.configure("Success.TButton", background=self.COLORS["success"], foreground="white", font=("Segoe UI", 10, "bold"), borderwidth=0)
+        style.map("Success.TButton", background=[("active", self.COLORS["success_hover"]), ("disabled", "#b9d9cf")], foreground=[("disabled", "#eefaf5")])
+        style.configure("Danger.TButton", background=self.COLORS["danger"], foreground="white", font=("Segoe UI", 10, "bold"), borderwidth=0)
+        style.map("Danger.TButton", background=[("active", self.COLORS["danger_hover"]), ("disabled", "#efc0c0")], foreground=[("disabled", "#fff5f5")])
+
+        style.configure("TEntry", fieldbackground="white", bordercolor=self.COLORS["border"], insertcolor=self.COLORS["text"])
+        style.configure("TCombobox", fieldbackground="white")
+        style.configure("Treeview", background="white", fieldbackground="white", rowheight=28, bordercolor=self.COLORS["border"])
+        style.configure("Treeview.Heading", background="#ecf1fb", foreground=self.COLORS["text"], font=("Segoe UI", 10, "bold"), relief="flat")
+        style.map("Treeview", background=[("selected", "#dfe8ff")], foreground=[("selected", self.COLORS["text"])])
+        style.configure("TProgressbar", thickness=12)
+
+    def _queue_message(self, type_, data=None, operation_id=None):
+        """Queue a UI message, optionally tied to an in-flight operation."""
+        self.msg_queue.put((operation_id, type_, data))
+
+    def _get_selected_model_id(self):
+        """Return the current model id from the combobox text."""
+        model_display = self.model_var.get().strip()
+        return model_display.split(" - ")[0] if " - " in model_display else model_display
+
     def _create_ui(self):
         """Create the main UI."""
-        main_frame = ttk.Frame(self.root, padding="15")
+        main_frame = ttk.Frame(self.root, padding="15", style="TFrame")
         main_frame.grid(row=0, column=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
         # Header with title and mode selection
-        header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill="x", pady=(0, 15))
+        hero_frame = tk.Frame(main_frame, bg=self.COLORS["hero"], bd=0, highlightthickness=0)
+        hero_frame.pack(fill="x", pady=(0, 15))
 
-        ttk.Label(
-            header_frame,
-            text=f"{APP_NAME}",
-            font=("Segoe UI", 18, "bold")
-        ).pack(side="left")
+        header_frame = ttk.Frame(hero_frame, style="Card.TFrame", padding=0)
+        header_frame.pack(fill="x", padx=1, pady=1)
 
+        hero_inner = tk.Frame(header_frame, bg=self.COLORS["hero"], padx=18, pady=16)
+        hero_inner.pack(fill="x")
+
+        title_wrap = ttk.Frame(hero_inner, style="Hero.TFrame")
+        title_wrap.pack(side="left")
+        ttk.Label(title_wrap, text=f"{APP_NAME}", style="HeroTitle.TLabel").pack(anchor="w")
         ttk.Label(
-            header_frame,
-            text=f"v{APP_VERSION}",
-            font=("Segoe UI", 10)
-        ).pack(side="left", padx=(5, 20))
+            title_wrap,
+            text=f"AI-powered media organization • Version {APP_VERSION}",
+            style="HeroSub.TLabel"
+        ).pack(anchor="w", pady=(2, 0))
+
+        self.provider_badge = ttk.Label(hero_inner, text="Provider: --", style="StatusBadge.TLabel")
+        self.provider_badge.pack(side="right", padx=(12, 0), pady=(6, 0))
 
         # Mode selection
-        mode_frame = ttk.Frame(header_frame)
-        mode_frame.pack(side="left", padx=20)
+        mode_frame = ttk.Frame(hero_inner, style="Hero.TFrame")
+        mode_frame.pack(side="left", padx=30, pady=(10, 0))
 
-        ttk.Label(mode_frame, text="Mode:").pack(side="left", padx=(0, 5))
+        ttk.Label(mode_frame, text="Mode:", style="HeroSub.TLabel").pack(side="left", padx=(0, 5))
         ttk.Radiobutton(
             mode_frame, text="Media (Plex/Jellyfin)",
             variable=self.mode_var, value="media",
-            command=self._on_mode_change
+            command=self._on_mode_change,
+            style="Hero.TRadiobutton"
         ).pack(side="left", padx=5)
         ttk.Radiobutton(
             mode_frame, text="Mass Rename (Any Files)",
             variable=self.mode_var, value="mass",
-            command=self._on_mode_change
+            command=self._on_mode_change,
+            style="Hero.TRadiobutton"
         ).pack(side="left", padx=5)
 
         # Platform selection (for media mode)
-        self.platform_frame = ttk.Frame(header_frame)
-        self.platform_frame.pack(side="left", padx=20)
+        self.platform_frame = ttk.Frame(hero_inner, style="Hero.TFrame")
+        self.platform_frame.pack(side="left", padx=20, pady=(10, 0))
 
         ttk.Label(self.platform_frame, text="Platform:").pack(side="left", padx=(0, 5))
         self.platform_combo = ttk.Combobox(
@@ -564,17 +800,18 @@ class RenameifyGUI:
 
         # Custom prompt button
         ttk.Button(
-            header_frame,
+            hero_inner,
             text="Custom Prompt...",
-            command=self._show_custom_prompt
-        ).pack(side="right", padx=5)
+            command=self._show_custom_prompt,
+            style="Accent.TButton"
+        ).pack(side="right", padx=5, pady=(6, 0))
 
         self.custom_prompt_indicator = ttk.Label(
-            header_frame,
+            hero_inner,
             text="",
-            foreground="green"
+            foreground="#b9ffd8"
         )
-        self.custom_prompt_indicator.pack(side="right", padx=5)
+        self.custom_prompt_indicator.pack(side="right", padx=5, pady=(8, 0))
 
         # Create notebook for tabs
         self.notebook = ttk.Notebook(main_frame)
@@ -621,14 +858,22 @@ class RenameifyGUI:
         action_frame = ttk.Frame(scan_frame)
         action_frame.pack(fill="x", pady=(0, 10))
 
-        self.scan_btn = ttk.Button(action_frame, text="Start Scan", command=self._start_scan)
+        self.scan_btn = ttk.Button(action_frame, text="▶ Start Scan", command=self._start_scan, style="Accent.TButton")
         self.scan_btn.pack(side="left")
+
+        self.stop_btn = ttk.Button(action_frame, text="■ Stop", command=self._stop_processing,
+                                    state="disabled", style="Danger.TButton")
+        self.stop_btn.pack(side="left", padx=(5, 0))
+
+        self.refresh_btn = ttk.Button(action_frame, text="↻ Refresh Files", command=self._refresh_files)
+        self.refresh_btn.pack(side="left", padx=(10, 0))
 
         self.apply_btn = ttk.Button(
             action_frame,
             text="Apply Selected Renames",
             command=self._apply_renames,
-            state="disabled"
+            state="disabled",
+            style="Success.TButton"
         )
         self.apply_btn.pack(side="left", padx=(10, 0))
 
@@ -711,7 +956,8 @@ class RenameifyGUI:
             btn_frame,
             text="Rollback Selected",
             command=self._rollback_selected,
-            state="disabled"
+            state="disabled",
+            style="Danger.TButton"
         )
         self.rollback_btn.pack(side="left", padx=(10, 0))
 
@@ -772,7 +1018,7 @@ class RenameifyGUI:
         btn_frame.grid(row=1, column=2, padx=(10, 0), pady=(10, 0))
         ttk.Button(btn_frame, text="Show", width=6, command=self._toggle_api_key).pack(side="left")
         ttk.Button(btn_frame, text="Save", command=self._save_api_key).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Test", command=self._test_api_connection).pack(side="left")
+        ttk.Button(btn_frame, text="Test", command=self._test_api_connection, style="Accent.TButton").pack(side="left")
 
         # Model selection
         ttk.Label(grid, text="Model:").grid(row=2, column=0, sticky="w", pady=(10, 0))
@@ -784,6 +1030,7 @@ class RenameifyGUI:
             width=40
         )
         self.model_combo.grid(row=2, column=1, sticky="w", pady=(10, 0))
+        self.model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
 
         # Refresh models button
         refresh_btn = ttk.Button(grid, text="Refresh Models", command=self._refresh_models)
@@ -835,17 +1082,10 @@ class RenameifyGUI:
         ).pack(anchor="w", pady=(5, 0))
 
     def _on_provider_change(self, event=None):
-        """Handle provider change - update model list and API key."""
-        provider_display = self.provider_var.get()
-        provider_map = {
-            "OpenAI": "openai",
-            "Anthropic (Claude)": "anthropic",
-            "Google (Gemini)": "google",
-            "OpenRouter": "openrouter"
-        }
-        provider = provider_map.get(provider_display, "openai")
+        """Handle provider change - update model list and API key, auto-save."""
+        provider = self.DISPLAY_TO_PROVIDER.get(self.provider_var.get(), "openai")
 
-        # Update config
+        # Update config immediately
         config = load_config()
         config["llm_provider"] = provider
         save_config(config)
@@ -855,7 +1095,7 @@ class RenameifyGUI:
         model_values = [f"{m[0]} - {m[1]}" for m in models]
         self.model_combo['values'] = model_values
 
-        # Set current model
+        # Set current model from config
         current_model = config.get(f"{provider}_model", models[0][0] if models else "")
         for i, m in enumerate(models):
             if m[0] == current_model:
@@ -876,36 +1116,38 @@ class RenameifyGUI:
             "openrouter": "Get key from openrouter.ai - Use any model!"
         }
         self.provider_info.config(text=info_text.get(provider, ""))
+        self.provider_badge.config(text=f"Provider: {self.provider_var.get()}")
+
+    def _on_model_change(self, event=None):
+        """Handle model selection change - auto-save to config."""
+        provider = self.DISPLAY_TO_PROVIDER.get(self.provider_var.get(), "openai")
+        model_display = self.model_var.get()
+        model_id = model_display.split(" - ")[0] if " - " in model_display else model_display
+        if model_id:
+            set_current_model(model_id, provider)
 
     def _refresh_models(self):
         """Refresh available models from the API."""
-        provider_display = self.provider_var.get()
-        provider_map = {
-            "OpenAI": "openai",
-            "Anthropic (Claude)": "anthropic",
-            "Google (Gemini)": "google",
-            "OpenRouter": "openrouter"
-        }
-        provider = provider_map.get(provider_display, "openai")
+        provider = self.DISPLAY_TO_PROVIDER.get(self.provider_var.get(), "openai")
 
         api_key = self.api_key_var.get().strip()
         if not api_key:
             messagebox.showwarning("Warning", "Please enter an API key first to fetch models.")
             return
 
-        self.progress_panel.update_progress(50, "Fetching models...", f"Connecting to {provider_display} API...")
+        self.progress_panel.update_progress(50, "Fetching models...", f"Connecting to {self.provider_var.get()} API...")
 
         def fetch_thread():
             try:
                 clear_model_cache()
                 models = fetch_available_models(provider, api_key)
                 if models:
-                    self.msg_queue.put(("update_models", (provider, models)))
-                    self.msg_queue.put(("status", ("Ready", 0, f"Fetched {len(models)} models")))
+                    self._queue_message("update_models", (provider, models))
+                    self._queue_message("status", ("Ready", 0, f"Fetched {len(models)} models"))
                 else:
-                    self.msg_queue.put(("status", ("Ready", 0, "Using default model list")))
+                    self._queue_message("status", ("Ready", 0, "Using default model list"))
             except Exception as e:
-                self.msg_queue.put(("status", ("Error", 0, f"Failed to fetch models: {e}")))
+                self._queue_message("status", ("Error", 0, f"Failed to fetch models: {e}"))
 
         threading.Thread(target=fetch_thread, daemon=True).start()
 
@@ -917,35 +1159,23 @@ class RenameifyGUI:
             self.model_combo.current(0)
 
     def _load_config(self):
-        """Load configuration into UI."""
+        """Load configuration into UI and restore state."""
         try:
             config = load_config()
             self.smart_filter_var.set(config.get("smart_folder_filter", True))
             self.restructure_var.set(config.get("restructure_folders", True))
             self.rename_folders_var.set(config.get("rename_folders", True))
             self.conf_var.set(config.get("confidence_threshold", 80))
-            self.batch_var.set(config.get("gpt_batch_size", 25))
+            self.batch_var.set(config.get("gpt_batch_size", 15))
 
             # LLM Provider
             provider = config.get("llm_provider", "openai")
-            provider_map = {
-                "openai": "OpenAI",
-                "anthropic": "Anthropic (Claude)",
-                "google": "Google (Gemini)",
-                "openrouter": "OpenRouter"
-            }
-            self.provider_var.set(provider_map.get(provider, "OpenAI"))
+            self.provider_var.set(self.PROVIDER_TO_DISPLAY.get(provider, "OpenAI"))
             self._on_provider_change()  # This updates model list and API key
 
             # Platform
             platform = config.get("platform", PLATFORM_GENERIC)
-            platform_map = {
-                PLATFORM_GENERIC: "Generic",
-                PLATFORM_PLEX: "Plex",
-                PLATFORM_JELLYFIN: "Jellyfin",
-                PLATFORM_EMBY: "Emby"
-            }
-            self.platform_var.set(platform_map.get(platform, "Generic"))
+            self.platform_var.set(self.PLATFORM_TO_DISPLAY.get(platform, "Generic"))
             self._update_plex_options_visibility()
 
             # Mode
@@ -963,8 +1193,21 @@ class RenameifyGUI:
             # Recent paths
             recent = get_recent_paths()
             self.path_combo['values'] = recent
-            if recent:
+
+            # Restore last path
+            last_path = config.get("last_path", "")
+            if last_path and os.path.isdir(last_path):
+                self.current_path.set(last_path)
+            elif recent:
                 self.path_combo.set(recent[0])
+
+            # Restore window geometry
+            geometry = config.get("window_geometry")
+            if geometry:
+                try:
+                    self.root.geometry(geometry)
+                except Exception:
+                    pass
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load config: {e}")
@@ -978,16 +1221,16 @@ class RenameifyGUI:
         else:
             self.platform_frame.pack_forget()
 
+        # Auto-save mode
+        config = load_config()
+        config["mode"] = mode
+        save_config(config)
+
     def _on_platform_change(self, event=None):
-        """Handle platform change."""
-        platform = self.platform_var.get()
-        platform_map = {
-            "Generic": PLATFORM_GENERIC,
-            "Plex": PLATFORM_PLEX,
-            "Jellyfin": PLATFORM_JELLYFIN,
-            "Emby": PLATFORM_EMBY
-        }
-        set_platform(platform_map.get(platform, PLATFORM_GENERIC))
+        """Handle platform change - auto-save."""
+        platform_display = self.platform_var.get()
+        platform = self.DISPLAY_TO_PLATFORM.get(platform_display, PLATFORM_GENERIC)
+        set_platform(platform)
         self._update_plex_options_visibility()
 
     def _update_plex_options_visibility(self):
@@ -1054,63 +1297,132 @@ class RenameifyGUI:
 
         if self.is_processing:
             return
-        self.is_processing = True
-        self.scan_btn.config(state="disabled")
+        operation_id = self._begin_processing()
         self._clear_results()
 
         add_recent_path(path)
         self.path_combo['values'] = get_recent_paths()
 
-        threading.Thread(target=self._browse_thread, args=(path,), daemon=True).start()
+        threading.Thread(target=self._browse_thread, args=(path, operation_id), daemon=True).start()
 
-    def _browse_thread(self, path):
+    def _begin_processing(self, can_stop: bool = True):
+        """Enter processing state and configure whether the current work can be stopped safely."""
+        self._operation_counter += 1
+        self._active_operation_id = self._operation_counter
+        self._active_operation_can_stop = can_stop
+        self._operation_cancel_tokens[self._active_operation_id] = reset_cancel()
+        if len(self._stale_operation_ids) > 64:
+            self._stale_operation_ids.clear()
+        self.is_processing = True
+        self.scan_btn.config(state="disabled")
+        self.refresh_btn.config(state="disabled")
+        self.stop_btn.config(state="normal" if can_stop else "disabled")
+        return self._active_operation_id
+
+    def _get_cancel_token(self, operation_id):
+        """Get the cancel token for a queued/background operation."""
+        return self._operation_cancel_tokens.get(operation_id)
+
+    def _end_processing(self):
+        """Exit processing state — enable scan, disable stop."""
+        self.is_processing = False
+        self._active_operation_can_stop = False
+        self.scan_btn.config(state="normal")
+        self.refresh_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+
+    def _stop_processing(self):
+        """Stop the current scan/identification process."""
+        if not self._active_operation_can_stop:
+            return
+        if self._active_operation_id is not None:
+            self._stale_operation_ids.add(self._active_operation_id)
+        self._active_operation_id = None
+        request_cancel()
+        self.progress_panel.update_progress(
+            self.progress_panel._target_progress,
+            "Stopped",
+            "Cancelled. Any late background responses will be ignored."
+        )
+        self._end_processing()
+
+    def _refresh_files(self):
+        """Refresh the file list by re-scanning the directory (no LLM calls)."""
+        path = self.current_path.get().strip()
+        if not path or not os.path.isdir(path):
+            messagebox.showwarning("Warning", "Please select a valid directory first.")
+            return
+        if self.is_processing:
+            return
+        self._start_browse(path)
+
+    def _browse_thread(self, path, operation_id):
         """Discover files in the directory without calling any API."""
         try:
+            cancel_token = self._get_cancel_token(operation_id)
+            bind_cancel_token(cancel_token)
             config = load_config()
 
             # Phase 1: Smart folder filtering (heuristics only, no GPT)
-            self.msg_queue.put(("status", ("Browsing...", 10, "Finding files...")))
+            self._queue_message("status", ("Browsing...", 10, "Finding files..."), operation_id)
             folders_to_scan = None
 
+            if is_cancelled():
+                self._queue_message("status", ("Stopped", 0, "Operation cancelled"), operation_id)
+                return
+
             if self.smart_filter_var.get():
-                self.msg_queue.put(("status", ("Browsing...", 10, "Smart filtering folders...")))
+                self._queue_message("status", ("Browsing...", 10, "Smart filtering folders..."), operation_id)
 
                 def filter_cb(msg: str):
-                    self.msg_queue.put(("status", ("Browsing...", 10, msg)))
+                    self._queue_message("status", ("Browsing...", 10, msg), operation_id)
 
                 # Never use GPT during browse - keep it independent of API
                 folders_to_scan, _folders_to_skip, classifications = smart_filter_folders(
                     path,
                     config=config,
                     progress_callback=filter_cb,
-                    use_gpt=False
+                    use_gpt=False,
+                    should_cancel=lambda: is_cancelled(cancel_token),
                 )
 
                 if classifications:
                     report = format_classification_report(classifications)
-                    self.msg_queue.put(("info", report))
+                    self._queue_message("info", report, operation_id)
 
                 # Safety net: never let filtering hide all files.
                 if not folders_to_scan:
-                    self.msg_queue.put((
+                    self._queue_message(
                         "info",
                         "Smart Folder Filter did not find any target folders.\n"
-                        "Falling back to full directory scan to avoid missing files."
-                    ))
+                        "Falling back to full directory scan to avoid missing files.",
+                        operation_id,
+                    )
                     folders_to_scan = None
+
+            if is_cancelled():
+                self._queue_message("status", ("Stopped", 0, "Operation cancelled"), operation_id)
+                return
 
             # Phase 2: File discovery
             def scan_cb(p: ScanProgress):
                 pct = 10 + (min(p.files_found, 500) / 500 * 80)  # estimate progress
                 details = f"Found {p.files_found} files in {p.folders_scanned} folders"
-                self.msg_queue.put(("status", ("Browsing...", pct, details)))
+                self._queue_message("status", ("Browsing...", pct, details), operation_id)
 
             media_files = scan_directory(
                 path,
                 config,
                 progress_callback=scan_cb,
-                folders_to_scan=folders_to_scan
+                folders_to_scan=folders_to_scan,
+                should_cancel=lambda: is_cancelled(cancel_token),
             )
+
+            if is_cancelled():
+                if media_files:
+                    self._queue_message("preview", (media_files, path), operation_id)
+                self._queue_message("status", ("Stopped", 0, "Browse cancelled"), operation_id)
+                return
 
             if not media_files:
                 mode = config.get("mode", "media")
@@ -1127,23 +1439,22 @@ class RenameifyGUI:
                            "- All files are in excluded folders\n"
                            "- Check your video extension settings\n"
                            "- Try switching to 'Mass Rename' mode for all file types")
-                self.msg_queue.put(("status", ("Complete", 100, "No files found in directory")))
-                self.msg_queue.put(("info", msg))
-                self.msg_queue.put(("done", None))
+                self._queue_message("status", ("Complete", 100, "No files found in directory"), operation_id)
+                self._queue_message("info", msg, operation_id)
                 return
 
             # Show files in preview (no rename info yet)
-            self.msg_queue.put(("preview", (media_files, path)))
-            self.msg_queue.put(("status", (
+            self._queue_message("preview", (media_files, path), operation_id)
+            self._queue_message("status", (
                 "Ready to Scan",
                 100,
                 f"Found {len(media_files)} files. Click 'Start Scan' to identify and generate rename plan."
-            )))
+            ), operation_id)
 
         except Exception as e:
-            self.msg_queue.put(("error", str(e)))
+            self._queue_message("error", str(e), operation_id)
         finally:
-            self.msg_queue.put(("done", None))
+            self._queue_message("done", None, operation_id)
 
     def _populate_preview(self, media_files):
         """Show discovered files in the results tree (before LLM identification)."""
@@ -1170,45 +1481,13 @@ class RenameifyGUI:
     def _save_api_key(self):
         key = self.api_key_var.get().strip()
         if key:
-            # Get current provider
-            provider_display = self.provider_var.get()
-            provider_map = {
-                "OpenAI": "openai",
-                "Anthropic (Claude)": "anthropic",
-                "Google (Gemini)": "google",
-                "OpenRouter": "openrouter"
-            }
-            provider = provider_map.get(provider_display, "openai")
+            provider = self.DISPLAY_TO_PROVIDER.get(self.provider_var.get(), "openai")
             set_api_key(key, provider)
-            messagebox.showinfo("Success", f"API Key Saved for {provider_display}")
+            messagebox.showinfo("Success", f"API Key Saved for {self.provider_var.get()}")
 
     def _save_general_settings(self):
         try:
-            config = load_config()
-
-            # Get current provider and model
-            provider_display = self.provider_var.get()
-            provider_map = {
-                "OpenAI": "openai",
-                "Anthropic (Claude)": "anthropic",
-                "Google (Gemini)": "google",
-                "OpenRouter": "openrouter"
-            }
-            provider = provider_map.get(provider_display, "openai")
-
-            # Extract model ID from display string (format: "model_id - description")
-            model_display = self.model_var.get()
-            model_id = model_display.split(" - ")[0] if " - " in model_display else model_display
-
-            config["llm_provider"] = provider
-            config[f"{provider}_model"] = model_id
-            config["restructure_folders"] = self.restructure_var.get()
-            config["rename_folders"] = self.rename_folders_var.get()
-            config["confidence_threshold"] = self.conf_var.get()
-            config["gpt_batch_size"] = self.batch_var.get()
-            config["smart_folder_filter"] = self.smart_filter_var.get()
-            config["mode"] = self.mode_var.get()
-            save_config(config)
+            self._save_all_settings_silent()
             messagebox.showinfo("Success", "Settings Saved")
         except Exception as e:
             messagebox.showerror("Error", str(e))
@@ -1219,55 +1498,35 @@ class RenameifyGUI:
             messagebox.showwarning("Warning", "Please enter an API key first.")
             return
 
-        # Get current provider
-        provider_display = self.provider_var.get()
-        provider_map = {
-            "OpenAI": "openai",
-            "Anthropic (Claude)": "anthropic",
-            "Google (Gemini)": "google",
-            "OpenRouter": "openrouter"
-        }
-        provider = provider_map.get(provider_display, "openai")
+        provider = self.DISPLAY_TO_PROVIDER.get(self.provider_var.get(), "openai")
 
-        self.progress_panel.update_progress(0, "Testing API...", f"Connecting to {provider_display}...")
+        self.progress_panel.update_progress(30, "Testing API...", f"Connecting to {self.provider_var.get()}...")
         threading.Thread(target=self._test_api_thread, args=(key, provider), daemon=True).start()
 
     def _test_api_thread(self, key, provider):
+        """Test API connection with a real JSON-returning prompt to verify full pipeline."""
         try:
-            if provider == "openai":
-                from openai import OpenAI
-                client = OpenAI(api_key=key)
-                client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": "hi"}],
-                    max_tokens=1
-                )
-            elif provider == "anthropic":
-                import anthropic
-                client = anthropic.Anthropic(api_key=key)
-                client.messages.create(
-                    model="claude-haiku-4-20250514",
-                    max_tokens=1,
-                    messages=[{"role": "user", "content": "hi"}]
-                )
-            elif provider == "google":
-                import google.generativeai as genai
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel("gemini-1.5-flash")
-                model.generate_content("hi", generation_config=genai.types.GenerationConfig(max_output_tokens=1))
-            elif provider == "openrouter":
-                from openai import OpenAI
-                client = OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1")
-                client.chat.completions.create(
-                    model="openai/gpt-4o-mini",
-                    messages=[{"role": "user", "content": "hi"}],
-                    max_tokens=1
-                )
+            bind_cancel_token(None)
+            model_used = self._get_selected_model_id() or get_current_model()
+            result = test_llm_connection(
+                provider=provider,
+                api_key=key,
+                model_name=model_used,
+                base_config=load_config(),
+            )
 
-            self.msg_queue.put(("status", ("Ready", 0, "API Test Passed!")))
-            self.root.after(0, lambda: messagebox.showinfo("Success", "API Connection Successful!"))
+            msg = (
+                "✅ API Connection Successful!\n\n"
+                f"Provider: {result['provider']}\n"
+                f"Model: {result['model']}\n"
+                f"Validated payload: {json.dumps(result['parsed'], ensure_ascii=False)}"
+            )
+            self._queue_message("status", ("Ready", 0, f"API test passed — {result['model']}"))
+
+            self.root.after(0, lambda: messagebox.showinfo("API Test Result", msg))
+
         except Exception as e:
-            self.msg_queue.put(("status", ("Error", 0, "API Test Failed")))
+            self._queue_message("status", ("Error", 0, "API Test Failed"))
             self.root.after(0, lambda: messagebox.showerror("Error", f"API Connection Failed:\n{str(e)}"))
 
     def _clear_results(self):
@@ -1280,7 +1539,7 @@ class RenameifyGUI:
         self.folder_rename_items = {}
         self.apply_btn.config(state="disabled")
         self.selection_label.config(text="Selected: 0 / 0")
-        self.progress_panel.update_progress(0, "Ready", "")
+        self.progress_panel.reset()
 
     # Selection management
     def _on_item_double_click(self, event):
@@ -1418,64 +1677,81 @@ class RenameifyGUI:
 
         # If no files discovered yet, or path changed since last browse, do full scan
         if not self.media_files or os.path.normpath(path) != os.path.normpath(self.scan_path):
-            self.is_processing = True
-            self.scan_btn.config(state="disabled")
+            operation_id = self._begin_processing()
             self._clear_results()
             add_recent_path(path)
             self.path_combo['values'] = get_recent_paths()
-            threading.Thread(target=self._full_scan_thread, args=(path,), daemon=True).start()
+            threading.Thread(target=self._full_scan_thread, args=(path, operation_id), daemon=True).start()
             return
 
         # Files already discovered - just run LLM identification
-        self.is_processing = True
-        self.scan_btn.config(state="disabled")
-        threading.Thread(target=self._scan_thread, args=(path,), daemon=True).start()
+        operation_id = self._begin_processing()
+        threading.Thread(target=self._scan_thread, args=(path, operation_id), daemon=True).start()
 
-    def _full_scan_thread(self, path):
+    def _full_scan_thread(self, path, operation_id):
         """Full scan: discover files + LLM identification (when user clicks Scan without browsing first)."""
         try:
+            cancel_token = self._get_cancel_token(operation_id)
+            bind_cancel_token(cancel_token)
             config = load_config()
 
             # Phase 1: File discovery
-            self.msg_queue.put(("status", ("Scanning...", 5, "Finding files...")))
+            self._queue_message("status", ("Scanning...", 5, "Finding files..."), operation_id)
             folders_to_scan = None
 
+            if is_cancelled():
+                self._queue_message("status", ("Stopped", 0, "Operation cancelled"), operation_id)
+                return
+
             if self.smart_filter_var.get():
-                self.msg_queue.put(("status", ("Scanning...", 5, "Smart filtering folders...")))
+                self._queue_message("status", ("Scanning...", 5, "Smart filtering folders..."), operation_id)
 
                 def filter_cb(msg: str):
-                    self.msg_queue.put(("status", ("Scanning...", 5, msg)))
+                    self._queue_message("status", ("Scanning...", 5, msg), operation_id)
 
-                use_gpt = bool(get_api_key())
+                use_gpt = bool(get_api_key("openai"))
                 folders_to_scan, _folders_to_skip, classifications = smart_filter_folders(
                     path,
                     config=config,
                     progress_callback=filter_cb,
-                    use_gpt=use_gpt
+                    use_gpt=use_gpt,
+                    should_cancel=lambda: is_cancelled(cancel_token),
                 )
 
                 if classifications:
                     report = format_classification_report(classifications)
-                    self.msg_queue.put(("info", report))
+                    self._queue_message("info", report, operation_id)
 
                 if not folders_to_scan:
-                    self.msg_queue.put((
+                    self._queue_message(
                         "info",
                         "Smart Folder Filter did not find any target folders.\n"
-                        "Falling back to full directory scan to avoid missing media files."
-                    ))
+                        "Falling back to full directory scan to avoid missing media files.",
+                        operation_id,
+                    )
                     folders_to_scan = None
+
+            if is_cancelled():
+                self._queue_message("status", ("Stopped", 0, "Operation cancelled"), operation_id)
+                return
 
             def scan_cb(p: ScanProgress):
                 details = f"Found {p.files_found} files in {p.folders_scanned} folders"
-                self.msg_queue.put(("status", ("Scanning...", 10, details)))
+                self._queue_message("status", ("Scanning...", 10, details), operation_id)
 
             media_files = scan_directory(
                 path,
                 config,
                 progress_callback=scan_cb,
-                folders_to_scan=folders_to_scan
+                folders_to_scan=folders_to_scan,
+                should_cancel=lambda: is_cancelled(cancel_token),
             )
+
+            if is_cancelled():
+                if media_files:
+                    self._queue_message("preview", (media_files, path), operation_id)
+                self._queue_message("status", ("Stopped", 0, "Cancelled after file discovery"), operation_id)
+                return
 
             if not media_files:
                 mode = config.get("mode", "media")
@@ -1492,61 +1768,88 @@ class RenameifyGUI:
                            "- All files are in excluded folders\n"
                            "- Check your video extension settings\n"
                            "- Try switching to 'Mass Rename' mode for all file types")
-                self.msg_queue.put(("status", ("Complete", 100, "No files found in directory")))
-                self.msg_queue.put(("info", msg))
-                self.msg_queue.put(("done", None))
+                self._queue_message("status", ("Complete", 100, "No files found in directory"), operation_id)
+                self._queue_message("info", msg, operation_id)
                 return
 
             # Store discovered files and run identification
-            self.msg_queue.put(("store_files", (media_files, path)))
-            self._run_llm_identification(media_files, path)
+            self._queue_message("store_files", (media_files, path), operation_id)
+            self._run_llm_identification(media_files, path, operation_id)
 
         except Exception as e:
-            self.msg_queue.put(("error", str(e)))
+            self._queue_message("error", str(e), operation_id)
         finally:
-            self.msg_queue.put(("done", None))
+            self._queue_message("done", None, operation_id)
 
-    def _scan_thread(self, path):
+    def _scan_thread(self, path, operation_id):
         """Run LLM identification on already-discovered files."""
         try:
-            self._run_llm_identification(self.media_files, path)
+            bind_cancel_token(self._get_cancel_token(operation_id))
+            self._run_llm_identification(self.media_files, path, operation_id)
         except Exception as e:
-            self.msg_queue.put(("error", str(e)))
+            self._queue_message("error", str(e), operation_id)
         finally:
-            self.msg_queue.put(("done", None))
+            self._queue_message("done", None, operation_id)
 
-    def _run_llm_identification(self, media_files, path):
+    def _run_llm_identification(self, media_files, path, operation_id):
         """Run LLM identification and plan generation on discovered files."""
+        cancel_token = self._get_cancel_token(operation_id)
         config = load_config()
         custom_prompt = get_custom_prompt() if self.custom_prompt_enabled.get() else None
 
+        total = len(media_files)
+        batch_size = config.get("gpt_batch_size", 15)
+        total_batches = (total + batch_size - 1) // batch_size
+
         # Identify
-        self.msg_queue.put(("status", ("Identifying...", 20, f"Identifying {len(media_files)} files...")))
+        self._queue_message("status", (
+            "Identifying...",
+            15,
+            f"Sending {total} files in {total_batches} batch(es) to AI..."
+        ), operation_id)
 
         def gpt_cb(p: GPTProgress):
-            pct = 20 + (p.files_processed / p.total_files * 70)
-            eta = f"{p.estimated_remaining:.0f}s" if p.estimated_remaining else "?"
-            details = f"Processed {p.files_processed}/{p.total_files} | ETA: {eta}"
-            self.msg_queue.put(("status", ("Identifying...", pct, details)))
+            if is_cancelled():
+                return
+            pct = 15 + (p.files_processed / max(p.total_files, 1) * 75)
+            elapsed_m, elapsed_s = divmod(int(p.elapsed_seconds), 60)
+            eta_m, eta_s = divmod(int(p.estimated_remaining), 60)
+            details = (f"{p.status} | {p.files_processed}/{p.total_files} files | "
+                       f"Elapsed: {elapsed_m}:{elapsed_s:02d} | ETA: {eta_m}:{eta_s:02d}")
+            self._queue_message("status", ("Identifying...", pct, details), operation_id)
 
         filenames_with_paths = [(f.filename + f.extension, str(f.path)) for f in media_files]
         media_info = identify_all_media(
             filenames_with_paths,
             config,
             progress_callback=gpt_cb,
-            custom_prompt=custom_prompt
+            custom_prompt=custom_prompt,
+            cancel_token=cancel_token,
         )
 
+        if is_cancelled():
+            # Show partial results if any
+            if media_info:
+                self._queue_message("status", ("Stopped", 90, "Generating plan from partial results..."), operation_id)
+                plan = generate_rename_plan(media_files, media_info, path, config)
+                self._queue_message("results", (plan, media_files, media_info), operation_id)
+                self._queue_message("status", ("Stopped", 100,
+                    f"Cancelled — partial plan: {len(plan.high_confidence)} renames"), operation_id)
+            else:
+                self._queue_message("status", ("Stopped", 0, "Operation cancelled"), operation_id)
+            return
+
         # Generate plan
-        self.msg_queue.put(("status", ("Planning...", 95, "Generating rename plan...")))
+        self._queue_message("status", ("Planning...", 95, "Generating rename plan..."), operation_id)
         plan = generate_rename_plan(media_files, media_info, path, config)
 
-        self.msg_queue.put(("results", (plan, media_files, media_info)))
-        self.msg_queue.put(("status", (
+        self._queue_message("results", (plan, media_files, media_info), operation_id)
+        self._queue_message("status", (
             "Complete",
             100,
-            f"Plan ready: {len(plan.high_confidence) + len(plan.low_confidence)} renames"
-        )))
+            f"Plan ready: {len(plan.high_confidence) + len(plan.low_confidence)} renames, "
+            f"{len(plan.folder_renames)} folder renames"
+        ), operation_id)
 
     def _apply_renames(self):
         if not self.current_plan:
@@ -1565,14 +1868,15 @@ class RenameifyGUI:
         if not messagebox.askyesno("Confirm", msg):
             return
 
-        self.is_processing = True
+        operation_id = self._begin_processing(can_stop=False)
         self.apply_btn.config(state="disabled")
-        threading.Thread(target=self._apply_thread, daemon=True).start()
+        threading.Thread(target=self._apply_thread, args=(operation_id,), daemon=True).start()
 
-    def _apply_thread(self):
+    def _apply_thread(self, operation_id):
         try:
+            bind_cancel_token(self._get_cancel_token(operation_id))
             config = load_config()
-            self.msg_queue.put(("status", ("Applying...", 0, "Starting rename operations...")))
+            self._queue_message("status", ("Applying...", 0, "Starting rename operations..."), operation_id)
 
             selected_operations = []
             threshold = config.get("confidence_threshold", 80)
@@ -1615,13 +1919,13 @@ class RenameifyGUI:
             if failed > 0:
                 msg += f". Errors: {'; '.join(errs[:3])}"
 
-            self.msg_queue.put(("status", ("Done", 100, msg)))
-            self.msg_queue.put(("refresh_history", None))
+            self._queue_message("status", ("Done", 100, msg), operation_id)
+            self._queue_message("refresh_history", None, operation_id)
 
         except Exception as e:
-            self.msg_queue.put(("error", str(e)))
+            self._queue_message("error", str(e), operation_id)
         finally:
-            self.msg_queue.put(("done", None))
+            self._queue_message("done", None, operation_id)
 
     # History
     def _refresh_history(self):
@@ -1651,27 +1955,34 @@ class RenameifyGUI:
         if not messagebox.askyesno("Confirm", "Rollback this operation?"):
             return
 
-        self.is_processing = True
-        threading.Thread(target=self._rollback_thread, args=(mid,), daemon=True).start()
+        operation_id = self._begin_processing(can_stop=False)
+        threading.Thread(target=self._rollback_thread, args=(mid, operation_id), daemon=True).start()
 
-    def _rollback_thread(self, mid):
+    def _rollback_thread(self, mid, operation_id):
         try:
-            self.msg_queue.put(("status", ("Rolling back...", 50, f"Restoring files...")))
+            bind_cancel_token(self._get_cancel_token(operation_id))
+            self._queue_message("status", ("Rolling back...", 50, f"Restoring files..."), operation_id)
             config = load_config()
             manifest = load_manifest(mid, config)
             if manifest:
                 s, f, e = execute_rollback(manifest, config)
-                self.msg_queue.put(("status", ("Done", 100, f"Restored {s} files.")))
-                self.msg_queue.put(("refresh_history", None))
+                self._queue_message("status", ("Done", 100, f"Restored {s} files."), operation_id)
+                self._queue_message("refresh_history", None, operation_id)
         except Exception as e:
-            self.msg_queue.put(("error", str(e)))
+            self._queue_message("error", str(e), operation_id)
         finally:
-            self.msg_queue.put(("done", None))
+            self._queue_message("done", None, operation_id)
 
     def _process_messages(self):
         try:
             while True:
-                type_, data = self.msg_queue.get_nowait()
+                operation_id, type_, data = self.msg_queue.get_nowait()
+
+                if operation_id in self._stale_operation_ids:
+                    continue
+
+                if self._active_operation_id is not None and operation_id is not None and operation_id != self._active_operation_id:
+                    continue
 
                 if type_ == "status":
                     st, pct, det = data
@@ -1681,8 +1992,12 @@ class RenameifyGUI:
                 elif type_ == "info":
                     messagebox.showinfo("Info", data)
                 elif type_ == "done":
-                    self.is_processing = False
-                    self.scan_btn.config(state="normal")
+                    if operation_id is not None:
+                        self._stale_operation_ids.add(operation_id)
+                        self._operation_cancel_tokens.pop(operation_id, None)
+                    if operation_id == self._active_operation_id:
+                        self._active_operation_id = None
+                    self._end_processing()
                     # If data contains a message, show it
                     if data and isinstance(data, str):
                         messagebox.showinfo("Complete", data)
@@ -1765,15 +2080,13 @@ class RenameifyGUI:
 
 
 def main():
+    """Launch the Renameify tkinter application."""
     root = tk.Tk()
-
-    style = ttk.Style()
-    if 'vista' in style.theme_names():
-        style.theme_use('vista')
-
-    app = RenameifyGUI(root)
+    RenameifyGUI(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
     main()
+
+

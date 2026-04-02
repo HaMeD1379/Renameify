@@ -71,14 +71,38 @@ def main():
         from gui.app import main as gui_main
         gui_main()
     except ImportError as e:
-        print(f"Error: Could not import GUI module: {e}")
-        print("Make sure all dependencies are installed: pip install openai")
+        _report_error(f"Could not import GUI module: {e}\n"
+                      "Make sure all dependencies are installed: pip install openai")
         return 1
     except Exception as e:
-        print(f"Error: {e}")
+        import traceback
+        _report_error(f"{e}\n\n{traceback.format_exc()}")
         return 1
 
     return 0
+
+
+def _report_error(message: str):
+    """Show an error to the user — handles both console and windowed frozen builds."""
+    print(f"Error: {message}")
+    if getattr(sys, 'frozen', False):
+        # In a windowed frozen build there is no console, so write a crash log
+        # and try to pop up a message box.
+        try:
+            log_path = Path(os.environ.get("USERPROFILE", ".")) / "Documents" / "Renameify" / "crash.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(message, encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            import tkinter as _tk
+            import tkinter.messagebox as _mb
+            _root = _tk.Tk()
+            _root.withdraw()
+            _mb.showerror("Renameify - Startup Error", message[:1500])
+            _root.destroy()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

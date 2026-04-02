@@ -240,7 +240,8 @@ def save_folder_fix_plan(fixes: List[FolderFix], root_path: str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     plan_filename = f"folder_fix_plan_{timestamp}.txt"
 
-    app_dir = Path(__file__).parent
+    app_dir = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Documents" / "Renameify" / "logs"
+    app_dir.mkdir(parents=True, exist_ok=True)
     plan_path = app_dir / plan_filename
 
     lines = [

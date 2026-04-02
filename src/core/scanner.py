@@ -132,7 +132,8 @@ def scan_directory(
     root_path: str,
     config: Optional[dict] = None,
     progress_callback: Optional[Callable[[ScanProgress], None]] = None,
-    folders_to_scan: Optional[List[str]] = None
+    folders_to_scan: Optional[List[str]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> List[MediaFile]:
     """
     Recursively scan a directory for media files and their subtitles.
@@ -204,8 +205,14 @@ def scan_directory(
         dirs_to_walk = [str(root)]
 
     for scan_root in dirs_to_walk:
+        if should_cancel and should_cancel():
+            return media_files
+
         scan_root_path = Path(scan_root).resolve()
         for dirpath, dirnames, filenames in os.walk(scan_root):
+            if should_cancel and should_cancel():
+                return media_files
+
             current_dir = Path(dirpath)
             folders_scanned += 1
             is_root = current_dir.resolve() == scan_root_path
@@ -257,6 +264,9 @@ def scan_directory(
             dir_subtitles = []
 
             for filename in filenames:
+                if should_cancel and should_cancel():
+                    return media_files
+
                 file_path = current_dir / filename
                 extension = file_path.suffix.lower()
 
@@ -292,14 +302,23 @@ def scan_directory(
 
             # Match subtitles to videos in same directory
             for video in dir_videos:
+                if should_cancel and should_cancel():
+                    return media_files
+
                 video.subtitles = find_matching_subtitles(video, dir_subtitles)
                 media_files.append(video)
 
             # Also check for subtitles in "Subs" or "Subtitles" subdirectories
             for subdir_name in ["Subs", "subs", "Subtitles", "subtitles", "Sub"]:
+                if should_cancel and should_cancel():
+                    return media_files
+
                 subs_dir = current_dir / subdir_name
                 if subs_dir.exists() and subs_dir.is_dir():
                     for sub_file in subs_dir.iterdir():
+                        if should_cancel and should_cancel():
+                            return media_files
+
                         if sub_file.suffix.lower() in subtitle_extensions:
                             lang = extract_subtitle_language(sub_file.stem)
                             subtitle = SubtitleFile(

@@ -425,9 +425,9 @@ def save_plan_to_file(plan: RenamePlan, config: Optional[dict] = None) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     plan_filename = f"rename_plan_{timestamp}.txt"
 
-    # Get app directory
-    app_dir = Path(__file__).parent
-    plan_path = app_dir / plan_filename
+    # Save to the Documents/Renameify/logs directory (works in frozen mode)
+    from .config import get_logs_dir
+    plan_path = get_logs_dir() / plan_filename
 
     lines = []
     lines.append("=" * 80)
@@ -1072,7 +1072,8 @@ def execute_rename_plan(
                         shutil.move(str(sub_original), str(sub_new))
                 except Exception as sub_e:
                     # Log subtitle errors but don't fail the operation
-                    errors.append(f"Subtitle warning - {sub_original.name}: {str(sub_e)}")
+                    sub_name = sub_op.get("original_path", "unknown")
+                    errors.append(f"Subtitle warning - {Path(sub_name).name}: {str(sub_e)}")
 
             # Clean up empty source directories after moving
             try:

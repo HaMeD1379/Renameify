@@ -234,30 +234,35 @@ For specials, use Season 0 and descriptive titles.
 
 ---
 
-## 📦 What's New in v2.0.0
+## 📦 What's New in v2.1.0
 
-### 🔧 Major Fixes
-- ✅ **Fixed API truncation bug** — Large batches (25+ files) now work perfectly
-- ✅ **Added max_output_tokens** — Responses API now includes token limit
-- ✅ **Exponential backoff** — Better rate limit handling (429 errors)
-- ✅ **Improved JSON recovery** — Salvages partial responses from truncation
-- ✅ **Reduced batch size** — 15 files default (better reliability)
+### 🚀 Major Improvements
+- ✅ **Cancellation Support** — Cancel long-running LLM operations and renames gracefully
+- ✅ **Updated Models** — Latest model support:
+  - Claude Sonnet 4 (claude-sonnet-4-20250514)
+  - Gemini 2.0 Flash (gemini-2.0-flash)
+  - OpenAI GPT-4o maintained as default
+- ✅ **Reduced Batch Size** — 12 files default (even better reliability than v2.0.0)
+- ✅ **Enhanced GUI** — Better threading, progress tracking, and cancellation UI
+- ✅ **Improved Error Handling** — More robust API error recovery
 
-### ⚡ Performance
+### ⚡ Performance (v2.1.0)
+- ✅ **Faster cancellation** — 2-3 second interrupt on long batches
+- ✅ **Better responsiveness** — GUI stays responsive during LLM calls
 - ✅ **Parallel batch processing** — Process 4+ batches simultaneously
-- ✅ **Staggered API submissions** — Avoids rate limit storms
-- ✅ **Smart chunk retry** — Failed batches split into thirds for re-attempt
+- ✅ **Optimized workers** — 2 concurrent workers for web search mode
 
 ### 📈 Quality
-- ✅ **54 unit tests** — Comprehensive test coverage
-- ✅ **Season extraction** — 100% accurate from folder paths
+- ✅ **54+ unit tests** — Comprehensive test coverage
+- ✅ **Season extraction** — 100% accurate from folder paths (supports 10+ languages)
 - ✅ **Episode titles** — 80%+ success rate via web search
 - ✅ **Specials detection** — Doctor Who, extras, behind-the-scenes all detected
 
-### 📚 Documentation
-- ✅ Complete README with examples
-- ✅ Inline code documentation
-- ✅ Test suite (`test_renameify.py`)
+### 🔄 Previous Release (v2.0.0) Highlights
+- Fixed API truncation bug for large batches
+- Exponential backoff for rate limit (429) errors
+- Improved JSON recovery for partial responses
+- Comprehensive documentation and testing
 
 ---
 

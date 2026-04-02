@@ -268,7 +268,7 @@ DEFAULT_CONFIG = {
     "rename_subtitles": True,
 
     # Batch size for GPT API calls (smaller = more reliable with web search)
-    "gpt_batch_size": 15,
+    "gpt_batch_size": 12,
 
     # Number of parallel GPT workers
     "gpt_parallel_workers": 3,
@@ -282,6 +282,10 @@ DEFAULT_CONFIG = {
     # UI preferences
     "ui_theme": "default",
     "show_advanced_options": False,
+
+    # Session state (auto-saved on close, restored on open)
+    "last_path": "",
+    "window_geometry": "",
 }
 
 

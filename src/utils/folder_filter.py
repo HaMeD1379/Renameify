@@ -8,12 +8,8 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Callable
 from dataclasses import dataclass
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-
 from core.config import load_config, get_api_key
+from core.gpt_service import call_llm, _extract_json_array
 
 
 @dataclass
@@ -50,10 +46,11 @@ Return ONLY a JSON array, no markdown:
 
 def classify_folders_with_gpt(
     folder_names: List[Tuple[str, str]],  # List of (folder_name, full_path)
-    config: Optional[dict] = None
+    config: Optional[dict] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> List[FolderClassification]:
     """
-    Use GPT to classify folders as media or non-media.
+    Use the configured LLM provider to classify folders as media or non-media.
 
     Args:
         folder_names: List of (folder_name, full_path) tuples
@@ -62,17 +59,11 @@ def classify_folders_with_gpt(
     Returns:
         List of FolderClassification objects
     """
-    if OpenAI is None:
-        raise ImportError("OpenAI package not installed")
-
     if config is None:
         config = load_config()
 
-    api_key = get_api_key()
-    if not api_key:
-        raise ValueError("OpenAI API key not configured")
-
-    client = OpenAI(api_key=api_key)
+    if should_cancel and should_cancel():
+        raise InterruptedError("Operation cancelled")
 
     # Format folder list
     folder_list = "\n".join([f"- {name}" for name, _ in folder_names])
@@ -81,26 +72,17 @@ def classify_folders_with_gpt(
     path_lookup = {name: path for name, path in folder_names}
 
     try:
-        response = client.chat.completions.create(
-            model=config.get("openai_model", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": FOLDER_FILTER_PROMPT},
-                {"role": "user", "content": f"Classify these folders:\n{folder_list}"}
-            ],
-            temperature=0.1,
-            max_tokens=2048
+        content = call_llm(
+            FOLDER_FILTER_PROMPT,
+            f"Classify these folders:\n{folder_list}",
+            config=config,
+            file_count=len(folder_names),
         )
 
-        content = response.choices[0].message.content.strip()
+        if should_cancel and should_cancel():
+            raise InterruptedError("Operation cancelled")
 
-        # Clean up response
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-        content = content.strip()
-
-        results = json.loads(content)
+        results = _extract_json_array(content)
 
         classifications = []
         for item in results:
@@ -119,15 +101,15 @@ def classify_folders_with_gpt(
 
         return classifications
 
-    except json.JSONDecodeError as e:
-        # If GPT response fails, assume all folders might be media
+    except (json.JSONDecodeError, ValueError):
+        # If LLM response fails to parse, assume all folders might be media
         return [
             FolderClassification(
                 path=path,
                 name=name,
                 classification="unknown",
                 confidence=50,
-                reason="GPT classification failed",
+                reason="LLM classification failed",
                 should_scan=True
             )
             for name, path in folder_names
@@ -338,7 +320,8 @@ def smart_filter_folders(
     root_path: str,
     config: Optional[dict] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
-    use_gpt: bool = True
+    use_gpt: bool = True,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Tuple[List[str], List[str], List[FolderClassification]]:
     """
     Smart filter folders to identify which ones to scan.
@@ -359,6 +342,9 @@ def smart_filter_folders(
     if progress_callback:
         progress_callback("Getting folder list...")
 
+    if should_cancel and should_cancel():
+        return [], [], []
+
     # Get top-level folders
     all_folders = get_top_level_folders(root_path)
 
@@ -375,6 +361,9 @@ def smart_filter_folders(
 
     # First pass: quick heuristic classification
     for name, path in all_folders:
+        if should_cancel and should_cancel():
+            return folders_to_scan, folders_to_skip, classifications
+
         should_scan, reason = quick_classify_folder(name, config)
 
         # If clearly media or clearly not, decide now
@@ -400,7 +389,10 @@ def smart_filter_folders(
         progress_callback(f"Checking {len(uncertain_folders)} uncertain folders for media content...")
 
     for name, path in uncertain_folders:
-        decision, reason = check_folder_contents(path, config)
+        if should_cancel and should_cancel():
+            return folders_to_scan, folders_to_skip, classifications
+
+        decision, reason = check_folder_contents(path, config, should_cancel=should_cancel)
 
         if decision == "media":
             folders_to_scan.append(path)
@@ -424,9 +416,16 @@ def smart_filter_folders(
             progress_callback(f"Using GPT to classify {len(still_uncertain)} remaining uncertain folders...")
 
         try:
-            gpt_classifications = classify_folders_with_gpt(still_uncertain, config)
+            gpt_classifications = classify_folders_with_gpt(
+                still_uncertain,
+                config,
+                should_cancel=should_cancel,
+            )
 
             for fc in gpt_classifications:
+                if should_cancel and should_cancel():
+                    return folders_to_scan, folders_to_skip, classifications
+
                 classifications.append(fc)
                 if fc.should_scan:
                     folders_to_scan.append(fc.path)
@@ -448,6 +447,9 @@ def smart_filter_folders(
     else:
         # No GPT, scan all uncertain folders
         for name, path in still_uncertain:
+            if should_cancel and should_cancel():
+                return folders_to_scan, folders_to_skip, classifications
+
             folders_to_scan.append(path)
             classifications.append(FolderClassification(
                 path=path, name=name, classification="unknown",
@@ -458,7 +460,11 @@ def smart_filter_folders(
     return folders_to_scan, folders_to_skip, classifications
 
 
-def check_folder_contents(folder_path: str, config: dict) -> Tuple[str, str]:
+def check_folder_contents(
+    folder_path: str,
+    config: dict,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Tuple[str, str]:
     """
     Check folder contents (subfolders and files) to determine if it's media.
 
@@ -480,6 +486,9 @@ def check_folder_contents(folder_path: str, config: dict) -> Tuple[str, str]:
 
         # Quick scan - don't go too deep
         for item in path.iterdir():
+            if should_cancel and should_cancel():
+                return "uncertain", "Operation cancelled"
+
             if item.is_dir():
                 subfolders.append(item.name)
                 # Check subfolder name

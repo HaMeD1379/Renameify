@@ -11,11 +11,14 @@ Features:
 - Media file identification (for Plex/Jellyfin/Emby)
 - Mass file renaming (generic files)
 - Custom prompt overrides
+- Cancellation support
 """
 import json
 import time
 import re
-from typing import List, Dict, Optional, Callable
+import warnings
+import importlib
+from typing import List, Optional, Callable
 from dataclasses import dataclass, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -33,11 +36,13 @@ except ImportError:
     anthropic = None
 
 try:
-    import google.generativeai as genai
+    from google import genai as google_genai
+    from google.genai import types as google_genai_types
 except ImportError:
-    genai = None
+    google_genai = None
+    google_genai_types = None
 
-from .config import load_config, get_api_key, get_custom_prompt, get_current_model
+from .config import load_config, get_api_key, get_current_model
 
 # Use absolute import to work with sys.path setup (both dev and PyInstaller)
 try:
@@ -45,6 +50,45 @@ try:
 except ImportError:
     # Fallback for relative import if running as package
     from ..prompts import get_prompt_manager, MEDIA_SYSTEM_PROMPT, MEDIA_USER_PROMPT
+
+
+# Global cancellation event — set by the GUI to abort in-flight LLM work
+_cancel_event = threading.Event()
+_cancel_generation = 0
+_cancel_lock = threading.Lock()
+_thread_state = threading.local()
+
+
+def bind_cancel_token(token: Optional[int]) -> None:
+    """Bind a cancellation token to the current thread."""
+    _thread_state.cancel_token = token
+
+
+def get_cancel_token() -> Optional[int]:
+    """Get the cancellation token bound to the current thread, if any."""
+    return getattr(_thread_state, "cancel_token", None)
+
+
+def request_cancel():
+    """Signal all running LLM operations to stop."""
+    _cancel_event.set()
+
+
+def reset_cancel() -> int:
+    """Start a fresh cancellation generation and return its token."""
+    global _cancel_generation
+    with _cancel_lock:
+        _cancel_generation += 1
+        _cancel_event.clear()
+        return _cancel_generation
+
+
+def is_cancelled(token: Optional[int] = None) -> bool:
+    """Check if cancellation has been requested for the current or specified token."""
+    active_token = get_cancel_token() if token is None else token
+    if active_token is not None and active_token != _cancel_generation:
+        return True
+    return _cancel_event.is_set()
 
 
 SPECIALS_FOLDER_NAMES = {
@@ -85,7 +129,7 @@ def extract_season_from_path(file_path: str) -> Optional[int]:
             return int(match.group(1))
 
         # Pattern 2: Season 01, Season 1, Season.01
-        match = re.match(r'^Season[\s\.]?(\d{1,2})$', folder_name, re.IGNORECASE)
+        match = re.match(r'^Season[\s.]?(\d{1,2})$', folder_name, re.IGNORECASE)
         if match:
             return int(match.group(1))
 
@@ -95,7 +139,7 @@ def extract_season_from_path(file_path: str) -> Optional[int]:
             return int(match.group(1))
 
         # Pattern 4: "Show Name Season 2"
-        match = re.search(r'\bSeason[\s\.]?(\d{1,2})$', folder_name, re.IGNORECASE)
+        match = re.search(r'\bSeason[\s.]?(\d{1,2})$', folder_name, re.IGNORECASE)
         if match:
             return int(match.group(1))
 
@@ -169,7 +213,7 @@ class MediaInfo:
     episode_title: Optional[str]
     confidence: int
     notes: Optional[str]
-    special_type: Optional[str] = None  # "special", "interview", "behind_the_scenes", "featurette", "deleted_scene", "short", etc.
+    special_type: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -213,12 +257,25 @@ class GPTProgress:
 
 
 def _estimate_max_tokens(file_count: int) -> int:
-    """Scale max_tokens based on batch size for reliable complete responses."""
-    # ~200 tokens per file in the response (JSON object with all fields)
-    # Generous buffer to avoid truncation, especially with web-search context
-    base = 1024
-    per_file = 200
-    return min(base + per_file * file_count, 16384)
+    """Scale max_tokens based on batch size for reliable complete responses.
+    
+    Optimized: use tighter estimates to reduce wasted tokens while
+    still leaving headroom for web-search context.
+    """
+    # ~150 tokens per file in the response (JSON object with all fields)
+    # Add buffer for formatting overhead
+    base = 512
+    per_file = 180
+    return min(base + per_file * file_count, 12288)
+
+
+def _sleep_with_cancel(duration: float, step: float = 0.1, token: Optional[int] = None) -> None:
+    """Sleep in short increments so cancellation is respected quickly."""
+    deadline = time.time() + max(duration, 0)
+    while time.time() < deadline:
+        if is_cancelled(token):
+            raise InterruptedError("Operation cancelled")
+        time.sleep(min(step, max(deadline - time.time(), 0)))
 
 
 def _extract_json_array(content: str) -> list:
@@ -285,7 +342,6 @@ def _extract_json_array(content: str) -> list:
             # Fallback: try aggressive bracket/brace closing
             open_braces = fragment.count("{") - fragment.count("}")
             open_brackets = fragment.count("[") - fragment.count("]")
-            # Close any open strings, objects, arrays
             if open_braces > 0:
                 fragment += '"' if fragment.rstrip()[-1:] not in ('"', '}', ']', ',') else ''
                 fragment += "}" * open_braces
@@ -315,12 +371,16 @@ def call_llm(
 
     Returns the raw text response from the LLM.
     file_count is used to scale max_tokens appropriately.
+    Raises CancelledError if cancellation was requested.
     """
+    if is_cancelled():
+        raise InterruptedError("Operation cancelled")
+
     if config is None:
         config = load_config()
 
     provider = config.get("llm_provider", "openai")
-    api_key = get_api_key(provider)
+    api_key = config.get(f"{provider}_api_key") or get_api_key(provider)
     max_tokens = _estimate_max_tokens(file_count)
 
     if not api_key:
@@ -338,12 +398,56 @@ def call_llm(
         raise ValueError(f"Unknown provider: {provider}")
 
 
+def test_llm_connection(
+    provider: str,
+    api_key: str,
+    model_name: Optional[str] = None,
+    base_config: Optional[dict] = None,
+) -> dict:
+    """Run a lightweight provider test using the same LLM pipeline as production calls."""
+    config = dict(base_config or load_config())
+    config["llm_provider"] = provider
+    config[f"{provider}_api_key"] = api_key.strip()
+
+    model_key = f"{provider}_model"
+    if model_name:
+        config[model_key] = model_name
+
+    resolved_model = config.get(model_key) or get_current_model()
+
+    # Keep test calls lightweight and deterministic.
+    if provider == "openai":
+        config["use_web_search"] = False
+
+    system_prompt = "You are a connection test assistant. Return only valid JSON."
+    user_prompt = (
+        "Return only this JSON array with no markdown or extra text: "
+        f"[{{\"status\":\"ok\",\"provider\":\"{provider}\",\"model\":\"{resolved_model}\"}}]"
+    )
+
+    content = call_llm(system_prompt, user_prompt, config=config, file_count=1)
+    results = _extract_json_array(content)
+    if not results or not isinstance(results[0], dict):
+        raise ValueError("Provider responded, but the response format was not valid JSON.")
+
+    first = results[0]
+    if first.get("status") != "ok":
+        raise ValueError(f"Unexpected validation payload: {first}")
+
+    return {
+        "provider": provider,
+        "model": first.get("model") or resolved_model,
+        "parsed": first,
+        "raw_response": content,
+    }
+
+
 def _call_openai(system_prompt: str, user_prompt: str, config: dict, api_key: str, max_tokens: int = 4096) -> str:
     """Call OpenAI API with web search support and robust error handling."""
     if OpenAI is None:
         raise ImportError("OpenAI package not installed. Run: pip install openai")
 
-    client = OpenAI(api_key=api_key, timeout=120.0)
+    client = OpenAI(api_key=api_key, timeout=90.0)
     model = config.get("openai_model", "gpt-4o")
     use_web_search = config.get("use_web_search", True)
 
@@ -351,6 +455,8 @@ def _call_openai(system_prompt: str, user_prompt: str, config: dict, api_key: st
     if use_web_search:
         last_ws_error = None
         for attempt in range(3):
+            if is_cancelled():
+                raise InterruptedError("Operation cancelled")
             try:
                 response = client.responses.create(
                     model=model,
@@ -366,28 +472,24 @@ def _call_openai(system_prompt: str, user_prompt: str, config: dict, api_key: st
                                 content += block.text
                 if content.strip():
                     return content.strip()
-                # Empty response — fall through to retry or standard
                 last_ws_error = "Empty response from web search"
             except Exception as e:
                 last_ws_error = e
                 err_str = str(e).lower()
-                # Rate limit — back off
                 if "rate" in err_str or "429" in err_str or "quota" in err_str:
                     wait = 2.0 * (2 ** attempt)
-                    time.sleep(wait)
+                    _sleep_with_cancel(wait)
                     continue
-                # Timeout — retry once then fall through
                 if "timeout" in err_str or "timed out" in err_str:
-                    time.sleep(1.0)
+                    _sleep_with_cancel(1.0)
                     continue
-                # Other error — fall through to standard chat
                 break
-        # If web search failed, log the reason and try standard completion
-        # (don't raise, because we have a fallback)
 
     # --- Standard Chat Completions API fallback ---
     last_error = None
     for attempt in range(3):
+        if is_cancelled():
+            raise InterruptedError("Operation cancelled")
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -402,15 +504,17 @@ def _call_openai(system_prompt: str, user_prompt: str, config: dict, api_key: st
             if not result:
                 raise RuntimeError("OpenAI returned empty response")
             return result.strip()
+        except InterruptedError:
+            raise
         except Exception as e:
             last_error = e
             err_str = str(e).lower()
             if "rate" in err_str or "429" in err_str or "quota" in err_str:
                 wait = 2.0 * (2 ** attempt)
-                time.sleep(wait)
+                _sleep_with_cancel(wait)
                 continue
             if "timeout" in err_str or "timed out" in err_str:
-                time.sleep(1.0)
+                _sleep_with_cancel(1.0)
                 continue
             raise RuntimeError(f"OpenAI API error: {e}")
 
@@ -418,100 +522,217 @@ def _call_openai(system_prompt: str, user_prompt: str, config: dict, api_key: st
 
 
 def _call_anthropic(system_prompt: str, user_prompt: str, config: dict, api_key: str, max_tokens: int = 4096) -> str:
-    """Call Anthropic Claude API."""
+    """Call Anthropic Claude API with retry logic."""
     if anthropic is None:
         raise ImportError("Anthropic package not installed. Run: pip install anthropic")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=90.0)
     model = config.get("anthropic_model", "claude-sonnet-4-20250514")
 
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_prompt}
-            ]
-        )
-        if not response.content:
-            raise RuntimeError("Anthropic returned empty response")
-        return response.content[0].text.strip()
+    last_error = None
+    for attempt in range(3):
+        if is_cancelled():
+            raise InterruptedError("Operation cancelled")
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+            if not response.content:
+                raise RuntimeError("Anthropic returned empty response")
+            return response.content[0].text.strip()
 
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"Anthropic API error: {e}")
+        except InterruptedError:
+            raise
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            if "rate" in err_str or "429" in err_str or "overloaded" in err_str:
+                wait = 2.0 * (2 ** attempt)
+                _sleep_with_cancel(wait)
+                continue
+            if "timeout" in err_str or "timed out" in err_str:
+                _sleep_with_cancel(1.0)
+                continue
+            raise RuntimeError(f"Anthropic API error: {e}")
+
+    raise RuntimeError(f"Anthropic API error after retries: {last_error}")
+
+
+def _get_google_sdk():
+    """Return the available Google SDK implementation, preferring google-genai."""
+    if google_genai is not None and google_genai_types is not None:
+        return "google-genai", google_genai, google_genai_types
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            legacy_genai = importlib.import_module("google.generativeai")
+        return "google-generativeai", legacy_genai, None
+    except ImportError:
+        return None, None, None
+
+
+def _extract_google_response_text(response) -> str:
+    """Extract plain text from either Google SDK response shape."""
+    text = getattr(response, "text", None)
+    if text:
+        return text.strip()
+
+    candidates = getattr(response, "candidates", None) or []
+    parts = []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            part_text = getattr(part, "text", None)
+            if part_text:
+                parts.append(part_text.strip())
+
+    return "\n".join(part for part in parts if part).strip()
+
+
+def call_google_text(
+    system_prompt: str,
+    user_prompt: str,
+    api_key: str,
+    model_name: str,
+    max_tokens: int = 4096,
+    temperature: float = 0.1,
+    timeout: int = 90,
+) -> str:
+    """Generate text with Gemini using google-genai when available, else the legacy SDK."""
+    sdk_name, sdk_module, sdk_types = _get_google_sdk()
+
+    if sdk_module is None:
+        raise ImportError("Google AI package not installed. Run: pip install google-genai")
+
+    if sdk_name == "google-genai":
+        client = sdk_module.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=user_prompt,
+            config=sdk_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            ),
+        )
+        text = _extract_google_response_text(response)
+        if not text:
+            raise RuntimeError("Google Gemini returned empty response")
+        return text
+
+    sdk_module.configure(api_key=api_key)
+    model = sdk_module.GenerativeModel(
+        model_name=model_name,
+        system_instruction=system_prompt
+    )
+    response = model.generate_content(
+        user_prompt,
+        generation_config=sdk_module.types.GenerationConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens
+        ),
+        request_options={"timeout": timeout}
+    )
+    text = _extract_google_response_text(response)
+    if not text:
+        raise RuntimeError("Google Gemini returned empty response")
+    return text
 
 
 def _call_google(system_prompt: str, user_prompt: str, config: dict, api_key: str, max_tokens: int = 4096) -> str:
-    """Call Google Gemini API."""
-    if genai is None:
-        raise ImportError("Google AI package not installed. Run: pip install google-generativeai")
-
-    genai.configure(api_key=api_key)
+    """Call Google Gemini API with retry logic."""
     model_name = config.get("google_model", "gemini-2.0-flash")
 
-    try:
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=system_prompt
-        )
-        response = model.generate_content(
-            user_prompt,
-            generation_config=genai.types.GenerationConfig(
+    last_error = None
+    for attempt in range(3):
+        if is_cancelled():
+            raise InterruptedError("Operation cancelled")
+        try:
+            return call_google_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                api_key=api_key,
+                model_name=model_name,
+                max_tokens=max_tokens,
                 temperature=0.1,
-                max_output_tokens=max_tokens
+                timeout=90,
             )
-        )
-        if not response.text:
-            raise RuntimeError("Google Gemini returned empty response")
-        return response.text.strip()
 
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"Google Gemini API error: {e}")
+        except InterruptedError:
+            raise
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            if "rate" in err_str or "429" in err_str or "quota" in err_str or "resource" in err_str:
+                wait = 2.0 * (2 ** attempt)
+                _sleep_with_cancel(wait)
+                continue
+            if "timeout" in err_str or "timed out" in err_str or "deadline" in err_str:
+                _sleep_with_cancel(1.0)
+                continue
+            raise RuntimeError(f"Google Gemini API error: {e}")
+
+    raise RuntimeError(f"Google Gemini API error after retries: {last_error}")
 
 
 def _call_openrouter(system_prompt: str, user_prompt: str, config: dict, api_key: str, max_tokens: int = 4096) -> str:
-    """Call OpenRouter API (OpenAI-compatible)."""
+    """Call OpenRouter API (OpenAI-compatible) with retry logic."""
     if OpenAI is None:
         raise ImportError("OpenAI package not installed. Run: pip install openai")
 
     client = OpenAI(
         api_key=api_key,
-        base_url="https://openrouter.ai/api/v1"
+        base_url="https://openrouter.ai/api/v1",
+        timeout=90.0
     )
     model = config.get("openrouter_model", "openai/gpt-4o-mini")
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.1,
-            max_tokens=max_tokens
-        )
-        result = response.choices[0].message.content
-        if not result:
-            raise RuntimeError("OpenRouter returned empty response")
-        return result.strip()
+    last_error = None
+    for attempt in range(3):
+        if is_cancelled():
+            raise InterruptedError("Operation cancelled")
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=max_tokens
+            )
+            result = response.choices[0].message.content
+            if not result:
+                raise RuntimeError("OpenRouter returned empty response")
+            return result.strip()
 
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"OpenRouter API error: {e}")
+        except InterruptedError:
+            raise
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            if "rate" in err_str or "429" in err_str or "quota" in err_str:
+                wait = 2.0 * (2 ** attempt)
+                _sleep_with_cancel(wait)
+                continue
+            if "timeout" in err_str or "timed out" in err_str:
+                _sleep_with_cancel(1.0)
+                continue
+            raise RuntimeError(f"OpenRouter API error: {e}")
+
+    raise RuntimeError(f"OpenRouter API error after retries: {last_error}")
 
 
 def _normalize_for_match(name: str) -> str:
     """Normalize a filename for fuzzy matching — lowercase, strip extension, collapse separators."""
-    # Remove common extensions
     name = re.sub(r'\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|mpg|mpeg|ts|m2ts|srt|sub|ass|ssa|vtt)$', '', name, flags=re.IGNORECASE)
-    # Replace dots, underscores, dashes with space, lowercase
-    name = re.sub(r'[\.\-_]+', ' ', name).lower().strip()
+    name = re.sub(r'[._-]+', ' ', name).lower().strip()
     return name
 
 
@@ -565,10 +786,13 @@ def identify_media_batch(
     Send a batch of filenames to the LLM for identification.
     Supports multiple providers (OpenAI, Anthropic Claude, Google Gemini, OpenRouter).
     """
+    if is_cancelled():
+        raise InterruptedError("Operation cancelled")
+
     if config is None:
         config = load_config()
 
-    # Format filenames with their folder paths
+    # Format filenames with their folder paths — compact format to save tokens
     filename_entries = []
     for fn, full_path in filenames_with_paths:
         path_obj = Path(full_path)
@@ -580,7 +804,8 @@ def identify_media_batch(
             if part.startswith('\\'):
                 continue
             relevant_parts.append(part)
-        folder_context = "/".join(relevant_parts[-5:]) if relevant_parts else ""
+        # Only include the last 3 path components to reduce tokens
+        folder_context = "/".join(relevant_parts[-3:]) if relevant_parts else ""
         filename_entries.append(f"- {fn} | {folder_context}")
 
     filename_list = "\n".join(filename_entries)
@@ -598,13 +823,17 @@ def identify_media_batch(
     content = None
     last_error = None
     for attempt in range(3):
+        if is_cancelled():
+            raise InterruptedError("Operation cancelled")
         try:
             content = call_llm(system_prompt, user_prompt, config, file_count=len(filenames_with_paths))
             if content:
                 break
+        except InterruptedError:
+            raise
         except Exception as e:
             last_error = e
-            time.sleep(1.0 * (attempt + 1))
+            _sleep_with_cancel(1.0 * (attempt + 1))
 
     if not content:
         raise RuntimeError(f"LLM call failed after 3 attempts: {last_error}")
@@ -613,7 +842,6 @@ def identify_media_batch(
     try:
         results = _extract_json_array(content)
     except ValueError:
-        # If JSON extraction totally fails, try to salvage individual objects
         results = _salvage_partial_json(content)
 
     if not results:
@@ -679,7 +907,6 @@ def _salvage_partial_json(content: str) -> list:
     Last-resort: find individual JSON objects {...} in the text and collect them into a list.
     """
     results = []
-    # Find all top-level { ... } blocks
     depth = 0
     start = None
     for i, ch in enumerate(content):
@@ -708,8 +935,10 @@ def rename_files_batch(
     """
     Send a batch of filenames to the LLM for generic rename suggestions.
     Used for mass file renaming mode.
-    Supports multiple providers (OpenAI, Anthropic Claude, Google Gemini, OpenRouter).
     """
+    if is_cancelled():
+        raise InterruptedError("Operation cancelled")
+
     if config is None:
         config = load_config()
 
@@ -725,7 +954,6 @@ def rename_files_batch(
             "\n".join(f"- {fn}" for fn in filenames)
         )
 
-    # For mass rename, we use an empty system prompt and put everything in user prompt
     system_prompt = "You are a file renaming assistant. Return only valid JSON."
 
     try:
@@ -747,6 +975,8 @@ def rename_files_batch(
 
     except json.JSONDecodeError as e:
         raise ValueError(f"Failed to parse LLM response: {e}")
+    except InterruptedError:
+        raise
     except Exception as e:
         raise RuntimeError(f"LLM API error: {e}")
 
@@ -757,10 +987,12 @@ def identify_all_media(
     progress_callback: Optional[Callable[[GPTProgress], None]] = None,
     parallel: bool = True,
     max_workers: int = 3,
-    custom_prompt: Optional[str] = None
+    custom_prompt: Optional[str] = None,
+    cancel_token: Optional[int] = None,
 ) -> List[MediaInfo]:
     """
     Identify all media files with batching and parallel processing.
+    Supports cancellation via request_cancel().
     """
     if config is None:
         config = load_config()
@@ -794,8 +1026,12 @@ def identify_all_media(
     completed_batches = [0]
 
     def process_batch(batch_info):
+        bind_cancel_token(cancel_token)
         batch_num, batch = batch_info
         batch_filenames = [fn for fn, _ in batch]
+
+        if is_cancelled():
+            return batch_num, [], "Cancelled"
 
         if progress_callback:
             elapsed = time.time() - start_time
@@ -810,42 +1046,53 @@ def identify_all_media(
                 current_files=batch_filenames[:3],
                 elapsed_seconds=elapsed,
                 estimated_remaining=remaining,
-                status="processing"
+                status=f"Batch {batch_num}/{total_batches}"
             )
             progress_callback(progress)
 
         # Try full batch, then retry with smaller splits on failure
         last_error = None
         for attempt in range(3):
+            if is_cancelled():
+                return batch_num, [], "Cancelled"
             try:
                 results = identify_media_batch(batch, config, custom_prompt)
                 return batch_num, results, None
+            except InterruptedError:
+                return batch_num, [], "Cancelled"
             except Exception as e:
                 last_error = e
                 err_str = str(e).lower()
-                # Exponential backoff for rate limits
                 if "rate" in err_str or "429" in err_str or "quota" in err_str:
-                    time.sleep(3.0 * (2 ** attempt))
+                    _sleep_with_cancel(3.0 * (2 ** attempt))
                 else:
-                    time.sleep(1.5 * (attempt + 1))
+                    _sleep_with_cancel(1.5 * (attempt + 1))
 
-        # Full batch failed — split into thirds (or halves for small batches)
+        # Full batch failed — split into smaller chunks
+        if is_cancelled():
+            return batch_num, [], "Cancelled"
+
         if len(batch) > 2:
             chunk_size = max(1, len(batch) // 3) if len(batch) > 6 else max(1, len(batch) // 2)
             chunks = [batch[i:i + chunk_size] for i in range(0, len(batch), chunk_size)]
             combined_results = []
             for chunk in chunks:
+                if is_cancelled():
+                    return batch_num, combined_results, "Cancelled"
                 for retry in range(2):
+                    if is_cancelled():
+                        return batch_num, combined_results, "Cancelled"
                     try:
                         chunk_results = identify_media_batch(chunk, config, custom_prompt)
                         combined_results.extend(chunk_results)
                         break
+                    except InterruptedError:
+                        return batch_num, combined_results, "Cancelled"
                     except Exception as chunk_err:
                         last_error = chunk_err
                         if retry == 0:
-                            time.sleep(2.0)
+                            _sleep_with_cancel(2.0)
                         else:
-                            # This chunk also failed — create error entries
                             for fn, path in chunk:
                                 combined_results.append(MediaInfo(
                                     original_filename=fn,
@@ -857,8 +1104,7 @@ def identify_all_media(
                                     confidence=0,
                                     notes=f"Error: {str(chunk_err)}"
                                 ))
-                # Small delay between chunk calls to avoid rate limits
-                time.sleep(0.5)
+                _sleep_with_cancel(0.5)
             return batch_num, combined_results, str(last_error)
 
         # Single file batch still failed
@@ -877,19 +1123,26 @@ def identify_all_media(
         return batch_num, error_results, str(last_error)
 
     if parallel and total_batches > 1:
-        # Use fewer workers when web search is enabled (more resource-intensive calls)
         use_web = config.get("use_web_search", True)
         effective_workers = min(2 if use_web else max_workers, total_batches)
 
-        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=effective_workers)
+        try:
             futures = {}
             for i, batch_info in enumerate(batches):
+                if is_cancelled():
+                    break
                 futures[executor.submit(process_batch, batch_info)] = batch_info
-                # Stagger submissions slightly to avoid simultaneous rate-limit hits
                 if i < len(batches) - 1:
-                    time.sleep(0.3)
+                    _sleep_with_cancel(0.3)
 
             for future in as_completed(futures):
+                if is_cancelled():
+                    for f in futures:
+                        f.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+
                 batch_num, results, error = future.result()
 
                 with results_lock:
@@ -909,11 +1162,16 @@ def identify_all_media(
                         current_files=[],
                         elapsed_seconds=elapsed,
                         estimated_remaining=remaining,
-                        status="processing" if completed_batches[0] < total_batches else "complete"
+                        status=f"Batch {completed_batches[0]}/{total_batches}" if completed_batches[0] < total_batches else "complete"
                     )
                     progress_callback(progress)
+        finally:
+            executor.shutdown(wait=not is_cancelled(), cancel_futures=is_cancelled())
     else:
         for batch_info in batches:
+            if is_cancelled():
+                break
+
             batch_num, results, error = process_batch(batch_info)
             all_results[batch_num - 1] = results
             completed_batches[0] += 1
@@ -931,12 +1189,12 @@ def identify_all_media(
                     current_files=[],
                     elapsed_seconds=elapsed,
                     estimated_remaining=remaining,
-                    status="processing" if completed_batches[0] < total_batches else "complete"
+                    status=f"Batch {completed_batches[0]}/{total_batches}" if completed_batches[0] < total_batches else "complete"
                 )
                 progress_callback(progress)
 
             if batch_num < total_batches:
-                time.sleep(0.3)
+                _sleep_with_cancel(0.3)
 
     final_results = []
     for batch_results in all_results:
@@ -944,6 +1202,7 @@ def identify_all_media(
             final_results.extend(batch_results)
 
     if progress_callback:
+        status = "cancelled" if is_cancelled() else "complete"
         progress = GPTProgress(
             current_batch=total_batches,
             total_batches=total_batches,
@@ -952,7 +1211,7 @@ def identify_all_media(
             current_files=[],
             elapsed_seconds=time.time() - start_time,
             estimated_remaining=0,
-            status="complete"
+            status=status
         )
         progress_callback(progress)
 
@@ -1027,7 +1286,6 @@ def format_folder_structure(info: MediaInfo, config: Optional[dict] = None) -> s
 
         season = info.season if info.season is not None else 1
         if season == 0:
-            # Specials go into a "Specials" folder (standard for Plex/Jellyfin/Emby)
             season_folder = "Specials"
         else:
             season_template = config.get("season_folder_template", "Season {season:02d}")
