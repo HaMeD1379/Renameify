@@ -32,6 +32,7 @@ from core.config import (
     PLATFORM_PLEX, PLATFORM_JELLYFIN, PLATFORM_EMBY, PLATFORM_GENERIC,
     get_available_models, get_current_model, set_current_model,
     fetch_available_models, clear_model_cache,
+    is_web_search_capable,
     APP_NAME as _APP_NAME, APP_VERSION as _APP_VERSION,
 )
 from core.scanner import scan_directory, ScanProgress
@@ -602,6 +603,7 @@ class RenameifyGUI:
         self.mode_var = tk.StringVar(value="media")  # media or mass
         self.custom_prompt_enabled = tk.BooleanVar(value=False)
         self.rename_folders_var = tk.BooleanVar(value=True)
+        self.model_status_var = tk.StringVar(value="")
 
         # State
         self.current_plan = None
@@ -729,93 +731,99 @@ class RenameifyGUI:
 
     def _create_ui(self):
         """Create the main UI."""
-        main_frame = ttk.Frame(self.root, padding="15", style="TFrame")
+        main_frame = ttk.Frame(self.root, padding="10", style="TFrame")
         main_frame.grid(row=0, column=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        # Header with title and mode selection
+        # ── Compact Hero Header (two-row layout) ─────────────────────────────
         hero_frame = tk.Frame(main_frame, bg=self.COLORS["hero"], bd=0, highlightthickness=0)
-        hero_frame.pack(fill="x", pady=(0, 15))
+        hero_frame.pack(fill="x", pady=(0, 10))
 
-        header_frame = ttk.Frame(hero_frame, style="Card.TFrame", padding=0)
-        header_frame.pack(fill="x", padx=1, pady=1)
-
-        hero_inner = tk.Frame(header_frame, bg=self.COLORS["hero"], padx=18, pady=16)
+        hero_inner = tk.Frame(hero_frame, bg=self.COLORS["hero"], padx=14, pady=10)
         hero_inner.pack(fill="x")
 
-        title_wrap = ttk.Frame(hero_inner, style="Hero.TFrame")
+        # Row 1: Title + badge
+        row1 = tk.Frame(hero_inner, bg=self.COLORS["hero"])
+        row1.pack(fill="x")
+
+        title_wrap = ttk.Frame(row1, style="Hero.TFrame")
         title_wrap.pack(side="left")
-        ttk.Label(title_wrap, text=f"{APP_NAME}", style="HeroTitle.TLabel").pack(anchor="w")
+        ttk.Label(title_wrap, text=f"{APP_NAME}", style="HeroTitle.TLabel").pack(side="left")
         ttk.Label(
             title_wrap,
-            text=f"AI-powered media organization • Version {APP_VERSION}",
+            text=f"  v{APP_VERSION}",
             style="HeroSub.TLabel"
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(side="left", pady=(4, 0))
 
-        self.provider_badge = ttk.Label(hero_inner, text="Provider: --", style="StatusBadge.TLabel")
-        self.provider_badge.pack(side="right", padx=(12, 0), pady=(6, 0))
+        self.provider_badge = ttk.Label(row1, text="Provider: --", style="StatusBadge.TLabel")
+        self.provider_badge.pack(side="right", padx=(12, 0))
+
+        # Row 2: Mode + Platform + Custom Prompt
+        row2 = tk.Frame(hero_inner, bg=self.COLORS["hero"])
+        row2.pack(fill="x", pady=(6, 0))
 
         # Mode selection
-        mode_frame = ttk.Frame(hero_inner, style="Hero.TFrame")
-        mode_frame.pack(side="left", padx=30, pady=(10, 0))
+        mode_frame = ttk.Frame(row2, style="Hero.TFrame")
+        mode_frame.pack(side="left")
 
-        ttk.Label(mode_frame, text="Mode:", style="HeroSub.TLabel").pack(side="left", padx=(0, 5))
+        ttk.Label(mode_frame, text="Mode:", style="HeroSub.TLabel").pack(side="left", padx=(0, 4))
         ttk.Radiobutton(
-            mode_frame, text="Media (Plex/Jellyfin)",
+            mode_frame, text="Media",
             variable=self.mode_var, value="media",
             command=self._on_mode_change,
             style="Hero.TRadiobutton"
-        ).pack(side="left", padx=5)
+        ).pack(side="left", padx=4)
         ttk.Radiobutton(
-            mode_frame, text="Mass Rename (Any Files)",
+            mode_frame, text="Mass Rename",
             variable=self.mode_var, value="mass",
             command=self._on_mode_change,
             style="Hero.TRadiobutton"
-        ).pack(side="left", padx=5)
+        ).pack(side="left", padx=4)
 
         # Platform selection (for media mode)
-        self.platform_frame = ttk.Frame(hero_inner, style="Hero.TFrame")
-        self.platform_frame.pack(side="left", padx=20, pady=(10, 0))
+        self.platform_frame = ttk.Frame(row2, style="Hero.TFrame")
+        self.platform_frame.pack(side="left", padx=(14, 0))
 
-        ttk.Label(self.platform_frame, text="Platform:").pack(side="left", padx=(0, 5))
+        ttk.Label(self.platform_frame, text="Platform:", style="HeroSub.TLabel").pack(side="left", padx=(0, 4))
         self.platform_combo = ttk.Combobox(
             self.platform_frame,
             textvariable=self.platform_var,
             values=["Generic", "Plex", "Jellyfin", "Emby"],
             state="readonly",
-            width=12
+            width=10
         )
-        self.platform_combo.pack(side="left", padx=5)
+        self.platform_combo.pack(side="left")
         self.platform_combo.bind("<<ComboboxSelected>>", self._on_platform_change)
 
         # Plex options button
         self.plex_options_btn = ttk.Button(
             self.platform_frame,
-            text="Plex Options...",
+            text="Plex Options…",
             command=self._show_plex_options
         )
-        self.plex_options_btn.pack(side="left", padx=5)
+        self.plex_options_btn.pack(side="left", padx=4)
         self.plex_options_btn.pack_forget()  # Hidden by default
 
-        # Custom prompt button
+        # Custom prompt indicator + button
+        self.custom_prompt_indicator = ttk.Label(
+            row2,
+            text="",
+            foreground="#b9ffd8",
+            font=("Segoe UI", 8)
+        )
+        self.custom_prompt_indicator.pack(side="left", padx=(10, 0))
+
         ttk.Button(
-            hero_inner,
-            text="Custom Prompt...",
+            row2,
+            text="Custom Prompt…",
             command=self._show_custom_prompt,
             style="Accent.TButton"
-        ).pack(side="right", padx=5, pady=(6, 0))
-
-        self.custom_prompt_indicator = ttk.Label(
-            hero_inner,
-            text="",
-            foreground="#b9ffd8"
-        )
-        self.custom_prompt_indicator.pack(side="right", padx=5, pady=(8, 0))
+        ).pack(side="right")
 
         # Create notebook for tabs
         self.notebook = ttk.Notebook(main_frame)
-        self.notebook.pack(fill="both", expand=True, pady=(0, 10))
+        self.notebook.pack(fill="both", expand=True, pady=(0, 8))
 
         self._create_scan_tab()
         self._create_history_tab()
@@ -916,11 +924,11 @@ class RenameifyGUI:
         self.results_tree.heading("type", text="Type")
         self.results_tree.heading("confidence", text="Confidence")
 
-        self.results_tree.column("selected", width=40, anchor="center")
-        self.results_tree.column("original", width=350)
-        self.results_tree.column("new_name", width=350)
-        self.results_tree.column("type", width=80)
-        self.results_tree.column("confidence", width=80)
+        self.results_tree.column("selected", width=35, minwidth=30, anchor="center")
+        self.results_tree.column("original", width=280, minwidth=120)
+        self.results_tree.column("new_name", width=280, minwidth=120)
+        self.results_tree.column("type", width=70, minwidth=50)
+        self.results_tree.column("confidence", width=75, minwidth=55)
 
         self.results_tree.bind("<Double-Button-1>", self._on_item_double_click)
         self.results_tree.bind("<Button-3>", self._show_context_menu)  # Right-click
@@ -985,9 +993,34 @@ class RenameifyGUI:
         self.history_tree.bind("<<TreeviewSelect>>", self._on_history_select)
 
     def _create_settings_tab(self):
-        """Create the settings tab."""
-        settings_frame = ttk.Frame(self.notebook, padding="15")
-        self.notebook.add(settings_frame, text="Settings")
+        """Create the settings tab with a scrollable canvas so it works on small monitors."""
+        outer_frame = ttk.Frame(self.notebook, padding="0")
+        self.notebook.add(outer_frame, text="Settings")
+
+        # --- Scrollable container ---
+        canvas = tk.Canvas(outer_frame, highlightthickness=0, bg=self.COLORS["bg"])
+        vsb = ttk.Scrollbar(outer_frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        settings_frame = ttk.Frame(canvas, padding="15")
+        win_id = canvas.create_window((0, 0), window=settings_frame, anchor="nw")
+
+        def _on_frame_configure(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(e):
+            canvas.itemconfig(win_id, width=e.width)
+
+        settings_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse-wheel scrolling
+        def _on_mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         # LLM Provider Configuration
         api_frame = ttk.LabelFrame(settings_frame, text="LLM Provider Configuration", padding="10")
@@ -995,6 +1028,7 @@ class RenameifyGUI:
 
         grid = ttk.Frame(api_frame)
         grid.pack(fill="x")
+        grid.columnconfigure(1, weight=1)
 
         # Provider selection
         ttk.Label(grid, text="Provider:").grid(row=0, column=0, sticky="w", padx=(0, 10))
@@ -1004,41 +1038,62 @@ class RenameifyGUI:
             textvariable=self.provider_var,
             values=["OpenAI", "Anthropic (Claude)", "Google (Gemini)", "OpenRouter"],
             state="readonly",
-            width=20
+            width=22
         )
         self.provider_combo.grid(row=0, column=1, sticky="w")
         self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
 
         # API Key
         ttk.Label(grid, text="API Key:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(10, 0))
-        self.api_entry = ttk.Entry(grid, textvariable=self.api_key_var, width=50, show="*")
-        self.api_entry.grid(row=1, column=1, sticky="w", pady=(10, 0))
+        api_key_frame = ttk.Frame(grid)
+        api_key_frame.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(10, 0))
+        api_key_frame.columnconfigure(0, weight=1)
 
-        btn_frame = ttk.Frame(grid)
-        btn_frame.grid(row=1, column=2, padx=(10, 0), pady=(10, 0))
-        ttk.Button(btn_frame, text="Show", width=6, command=self._toggle_api_key).pack(side="left")
-        ttk.Button(btn_frame, text="Save", command=self._save_api_key).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Test", command=self._test_api_connection, style="Accent.TButton").pack(side="left")
+        self.api_entry = ttk.Entry(api_key_frame, textvariable=self.api_key_var, show="*")
+        self.api_entry.grid(row=0, column=0, sticky="ew")
+
+        btn_sub_frame = ttk.Frame(api_key_frame)
+        btn_sub_frame.grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(btn_sub_frame, text="Show", width=6, command=self._toggle_api_key).pack(side="left")
+        ttk.Button(btn_sub_frame, text="Save", command=self._save_api_key).pack(side="left", padx=4)
+        # "Test & Refresh" button: tests connection AND refreshes/filters model list
+        self.test_btn = ttk.Button(
+            btn_sub_frame, text="Test & Refresh",
+            command=self._test_and_refresh, style="Accent.TButton"
+        )
+        self.test_btn.pack(side="left")
 
         # Model selection
         ttk.Label(grid, text="Model:").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        model_frame = ttk.Frame(grid)
+        model_frame.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(10, 0))
+        model_frame.columnconfigure(0, weight=1)
+
         self.model_var = tk.StringVar()
         self.model_combo = ttk.Combobox(
-            grid,
+            model_frame,
             textvariable=self.model_var,
             state="readonly",
-            width=40
         )
-        self.model_combo.grid(row=2, column=1, sticky="w", pady=(10, 0))
+        self.model_combo.grid(row=0, column=0, sticky="ew")
         self.model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
 
-        # Refresh models button
-        refresh_btn = ttk.Button(grid, text="Refresh Models", command=self._refresh_models)
-        refresh_btn.grid(row=2, column=2, padx=(10, 0), pady=(10, 0))
+        # Model status label (shown while testing)
+        self.model_status_var = tk.StringVar(value="")
+        ttk.Label(model_frame, textvariable=self.model_status_var,
+                  font=("Segoe UI", 8), foreground="gray").grid(row=1, column=0, sticky="w")
 
         # Provider info label
         self.provider_info = ttk.Label(grid, text="", font=("Segoe UI", 9), foreground="gray")
         self.provider_info.grid(row=3, column=1, sticky="w", pady=(5, 0))
+
+        # Web search availability note
+        self.web_search_info = ttk.Label(
+            api_frame,
+            text="ℹ️  Only models supporting web search are shown for OpenAI (required for episode title lookup).",
+            font=("Segoe UI", 8), foreground=self.COLORS["muted"], wraplength=600
+        )
+        self.web_search_info.pack(anchor="w", pady=(6, 0))
 
         # General Settings
         gen_frame = ttk.LabelFrame(settings_frame, text="General Settings", padding="10")
@@ -1072,7 +1127,8 @@ class RenameifyGUI:
         ttk.Label(
             info_frame,
             text=f"Config stored in: {config_dir}",
-            font=("Consolas", 9)
+            font=("Consolas", 9),
+            wraplength=600
         ).pack(anchor="w")
 
         ttk.Button(
@@ -1127,29 +1183,8 @@ class RenameifyGUI:
             set_current_model(model_id, provider)
 
     def _refresh_models(self):
-        """Refresh available models from the API."""
-        provider = self.DISPLAY_TO_PROVIDER.get(self.provider_var.get(), "openai")
-
-        api_key = self.api_key_var.get().strip()
-        if not api_key:
-            messagebox.showwarning("Warning", "Please enter an API key first to fetch models.")
-            return
-
-        self.progress_panel.update_progress(50, "Fetching models...", f"Connecting to {self.provider_var.get()} API...")
-
-        def fetch_thread():
-            try:
-                clear_model_cache()
-                models = fetch_available_models(provider, api_key)
-                if models:
-                    self._queue_message("update_models", (provider, models))
-                    self._queue_message("status", ("Ready", 0, f"Fetched {len(models)} models"))
-                else:
-                    self._queue_message("status", ("Ready", 0, "Using default model list"))
-            except Exception as e:
-                self._queue_message("status", ("Error", 0, f"Failed to fetch models: {e}"))
-
-        threading.Thread(target=fetch_thread, daemon=True).start()
+        """Legacy — replaced by Test & Refresh button."""
+        self._test_and_refresh()
 
     def _update_models_ui(self, provider, models):
         """Update the model dropdown with fetched models."""
@@ -1157,6 +1192,100 @@ class RenameifyGUI:
         self.model_combo['values'] = model_values
         if model_values:
             self.model_combo.current(0)
+
+    # ------------------------------------------------------------------
+    # Test & Refresh  (new combined action)
+    # ------------------------------------------------------------------
+
+    def _test_and_refresh(self):
+        """
+        Test API connection AND refresh the model list in one go.
+
+        Steps (run in background):
+          1. Test connection with the currently selected model.
+          2. Fetch all available models from the provider.
+          3. For OpenAI – filter to only web-search-capable models.
+          4. Update the model dropdown; keep current selection if still valid.
+          5. Show a summary messagebox.
+        """
+        key = self.api_key_var.get().strip()
+        if not key:
+            messagebox.showwarning("Warning", "Please enter an API key first.")
+            return
+
+        provider = self.DISPLAY_TO_PROVIDER.get(self.provider_var.get(), "openai")
+
+        # Auto-save the API key so the refresh thread can use it
+        from core.config import set_api_key as _set_api_key
+        _set_api_key(key, provider)
+
+        self.test_btn.config(state="disabled")
+        self.model_status_var.set("Testing…")
+        self.progress_panel.update_progress(20, "Testing & refreshing…",
+                                            f"Connecting to {self.provider_var.get()}…")
+
+        threading.Thread(target=self._test_and_refresh_thread,
+                         args=(key, provider), daemon=True).start()
+
+    def _test_and_refresh_thread(self, key: str, provider: str):
+        """Background worker for Test & Refresh."""
+        try:
+            bind_cancel_token(None)
+            model_used = self._get_selected_model_id() or get_current_model()
+
+            # --- Step 1: connection test ---
+            self.root.after(0, lambda: self.progress_panel.update_progress(
+                30, "Testing…", "Verifying API connection…"))
+            result = test_llm_connection(
+                provider=provider,
+                api_key=key,
+                model_name=model_used,
+                base_config=load_config(),
+            )
+
+            # --- Step 2: fetch full model list ---
+            self.root.after(0, lambda: self.progress_panel.update_progress(
+                60, "Fetching models…", "Retrieving available models…"))
+            clear_model_cache()
+            all_models = fetch_available_models(provider, key)
+
+            # --- Step 3: filter for web-search-compatible (OpenAI only) ---
+            if provider == "openai":
+                filtered = [(mid, desc) for mid, desc in all_models
+                            if is_web_search_capable(mid)]
+                if not filtered:
+                    # Fallback: keep all if filter is too aggressive
+                    filtered = all_models
+                filter_note = f" ({len(filtered)} web-search-capable models shown)"
+            else:
+                filtered = all_models
+                filter_note = f" ({len(filtered)} models)"
+
+            # --- Step 4: update UI ---
+            self._queue_message("update_models_filtered", (provider, filtered, model_used))
+            self._queue_message("status", (
+                "Ready",
+                0,
+                f"✅ API OK — {result['model']}{filter_note}"
+            ))
+
+            # Build summary
+            msg = (
+                "✅ API Connection Successful!\n\n"
+                f"Provider: {result['provider']}\n"
+                f"Model tested: {result['model']}\n"
+                f"Available models: {len(filtered)}\n"
+                f"Validated payload: {json.dumps(result['parsed'], ensure_ascii=False)}"
+            )
+            self.root.after(0, lambda: messagebox.showinfo("Test & Refresh Result", msg))
+
+        except Exception as e:
+            self._queue_message("status", ("Error", 0, f"Test failed: {e}"))
+            self.root.after(0, lambda: messagebox.showerror(
+                "Test Failed", f"API Connection Failed:\n{e}"))
+        finally:
+            self.root.after(0, lambda: self.test_btn.config(state="normal"))
+            self.root.after(0, lambda: self.model_status_var.set(""))
 
     def _load_config(self):
         """Load configuration into UI and restore state."""
@@ -1493,41 +1622,9 @@ class RenameifyGUI:
             messagebox.showerror("Error", str(e))
 
     def _test_api_connection(self):
-        key = self.api_key_var.get().strip()
-        if not key:
-            messagebox.showwarning("Warning", "Please enter an API key first.")
-            return
+        """Legacy alias — delegates to _test_and_refresh."""
+        self._test_and_refresh()
 
-        provider = self.DISPLAY_TO_PROVIDER.get(self.provider_var.get(), "openai")
-
-        self.progress_panel.update_progress(30, "Testing API...", f"Connecting to {self.provider_var.get()}...")
-        threading.Thread(target=self._test_api_thread, args=(key, provider), daemon=True).start()
-
-    def _test_api_thread(self, key, provider):
-        """Test API connection with a real JSON-returning prompt to verify full pipeline."""
-        try:
-            bind_cancel_token(None)
-            model_used = self._get_selected_model_id() or get_current_model()
-            result = test_llm_connection(
-                provider=provider,
-                api_key=key,
-                model_name=model_used,
-                base_config=load_config(),
-            )
-
-            msg = (
-                "✅ API Connection Successful!\n\n"
-                f"Provider: {result['provider']}\n"
-                f"Model: {result['model']}\n"
-                f"Validated payload: {json.dumps(result['parsed'], ensure_ascii=False)}"
-            )
-            self._queue_message("status", ("Ready", 0, f"API test passed — {result['model']}"))
-
-            self.root.after(0, lambda: messagebox.showinfo("API Test Result", msg))
-
-        except Exception as e:
-            self._queue_message("status", ("Error", 0, "API Test Failed"))
-            self.root.after(0, lambda: messagebox.showerror("Error", f"API Connection Failed:\n{str(e)}"))
 
     def _clear_results(self):
         self.results_tree.delete(*self.results_tree.get_children())

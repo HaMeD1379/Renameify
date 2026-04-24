@@ -80,6 +80,9 @@ build/output/
 build/*.spec
 onefile/
 
+# Allow the portable release executable
+!dist/portable/Renameify.exe
+
 # Temporary files
 *.tmp
 *.temp
@@ -87,5 +90,4 @@ onefile/
 _*.py
 
 # Development documentation
-AGENTS.md
 CLAUDE.md

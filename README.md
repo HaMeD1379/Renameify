@@ -1,4 +1,4 @@
-# 🎬 Renameify v2.1.0
+# 🎬 Renameify v2.1.1
 
 <div align="center">
 
@@ -233,6 +233,21 @@ For specials, use Season 0 and descriptive titles.
 - Consider upgrading your OpenAI tier
 
 ---
+
+## 📦 What's New in v2.1.1
+
+### 🔧 Fixes & Improvements
+- ✅ **Test & Refresh button** — The API Test button now also fetches the live model list in one click. For OpenAI, only models that support web search (Responses API + `web_search_preview` tool) are shown; incompatible models (o-series reasoning models, etc.) are automatically filtered out.
+- ✅ **Proper model names** — Models are fetched directly from the provider API and displayed with human-readable names.
+- ✅ **Plex Specials rules** — Specials nested inside `Season XX/Specials/` folders are now correctly consolidated to a single top-level `Specials/` folder under the show root, matching Plex's required structure:
+  ```
+  Show Name (Year)/
+    Season 01/
+    Season 02/
+    Specials/          ← All S00 episodes here
+      Show - S00E01 - Title.mkv
+  ```
+- ✅ **GUI scaling** — Compact two-row header uses less vertical space; Settings tab is now fully scrollable so nothing is hidden on small/1080p monitors; minimum window size reduced to 820×580.
 
 ## 📦 What's New in v2.1.0
 

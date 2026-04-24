@@ -169,6 +169,37 @@ SPECIALS_FOLDER_NAMES = {
 }
 
 
+def _find_show_root_for_specials(file_path: Path, root_path: str) -> Optional[Path]:
+    """
+    Walk up from *file_path* skipping Season and Specials folders until a
+    non-season, non-specials folder is found — that folder is the show root.
+
+    Used by Plex specials consolidation to determine where ``Specials/`` should live.
+    Returns ``None`` if the structure cannot be determined.
+    """
+    root = Path(root_path)
+    current = file_path.parent
+    found_season_or_specials = False
+
+    while current.name:  # stop at filesystem root
+        name_lower = current.name.lower()
+        is_specials = name_lower in SPECIALS_FOLDER_NAMES
+        is_season = normalize_season_folder_name(current.name) is not None
+
+        if is_specials or is_season:
+            found_season_or_specials = True
+            current = current.parent
+        elif found_season_or_specials:
+            # We climbed through at least one season/specials folder.
+            # The current folder is the show root.
+            return current
+        else:
+            # Never hit a season/specials folder — can't determine show root
+            return None
+
+    return None
+
+
 def is_scene_release_folder(folder_name: str) -> bool:
     """Check if a folder name looks like a scene-release name that needs cleanup."""
     # Don't flag legitimate specials/extras folders
@@ -713,9 +744,24 @@ def generate_rename_plan(
         new_filename = sanitize_filename(format_media_info(info, config))
         new_filename_with_ext = new_filename + media_file.extension
 
-        # Files are always renamed in-place (same directory).
-        # Folder structure changes are handled separately via folder_renames.
+        # Files are always renamed in-place (same directory) unless Plex specials
+        # consolidation needs to move them to the top-level Specials folder.
         new_path = media_file.path.parent / new_filename_with_ext
+
+        # --- Plex specials consolidation ---
+        # Plex requires that all specials (season 0) live in a single "Specials"
+        # folder directly under the show root, NOT inside Season XX sub-folders.
+        platform = config.get("platform", "generic")
+        is_special = (info.season == 0) or (getattr(info, 'special_type', None) is not None)
+        if platform == "plex" and is_special:
+            show_root = _find_show_root_for_specials(media_file.path, root_path)
+            if show_root is None:
+                # File is directly under scan root with no season parent — use root
+                show_root = Path(root_path)
+            target_specials_dir = show_root / "Specials"
+            # Only redirect if not already in the correct Specials folder
+            if media_file.path.parent != target_specials_dir:
+                new_path = target_specials_dir / new_filename_with_ext
 
         # Check if already correctly named (exact path match)
         if str(media_file.path) == str(new_path):

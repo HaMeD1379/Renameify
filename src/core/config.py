@@ -13,11 +13,12 @@ Supports multiple platforms:
 import os
 import sys
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
 APP_NAME = "Renameify"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.1"
 __version__ = APP_VERSION
 __app_name__ = APP_NAME
 CONFIG_FILENAME = "renameify_config.json"
@@ -551,7 +552,11 @@ def fetch_available_models(provider: str = None, api_key: str = None) -> list:
 
 
 def _fetch_models_from_api(provider: str, api_key: str) -> list:
-    """Internal function to fetch models from API."""
+    """Internal function to fetch models from API.
+
+    For OpenAI, only models that support the web_search_preview tool (Responses API)
+    are returned.  For other providers, all chat-capable models are returned.
+    """
     import httpx
 
     models = []
@@ -565,20 +570,16 @@ def _fetch_models_from_api(provider: str, api_key: str) -> list:
             )
             if response.status_code == 200:
                 data = response.json()
-                # Filter for chat models
-                chat_models = []
+                capable = []
                 for m in data.get("data", []):
                     model_id = m.get("id", "")
-                    # Include GPT models, o-series reasoning models
-                    if any(x in model_id for x in ["gpt-4", "gpt-5", "gpt-3.5", "o1", "o3", "o4"]):
-                        if "instruct" not in model_id and "vision" not in model_id:
-                            chat_models.append(model_id)
+                    if is_web_search_capable(model_id):
+                        capable.append(model_id)
 
-                # Sort and deduplicate
-                chat_models = sorted(set(chat_models), reverse=True)
+                # Sort: newer (longer/dated) models first, then deduplicate
+                capable = sorted(set(capable), reverse=True)
 
-                # Create tuples with descriptions
-                for model_id in chat_models[:15]:  # Limit to top 15
+                for model_id in capable[:20]:
                     desc = _get_model_description(model_id)
                     models.append((model_id, desc))
         except Exception:
@@ -593,9 +594,11 @@ def _fetch_models_from_api(provider: str, api_key: str) -> list:
             )
             if response.status_code == 200:
                 data = response.json()
-                for m in data.get("data", [])[:30]:  # Limit to 30 models
+                for m in data.get("data", [])[:40]:
                     model_id = m.get("id", "")
                     name = m.get("name", model_id)
+                    if not name or name == model_id:
+                        name = _get_model_description(model_id)
                     models.append((model_id, name))
         except Exception:
             pass
@@ -630,3 +633,29 @@ def clear_model_cache():
     global _cached_models, _cache_timestamp
     _cached_models = {}
     _cache_timestamp = 0
+
+
+# Model IDs / prefixes that support OpenAI's web_search_preview tool
+# (Responses API).  Reasoning models (o1/o3/o4) and older GPT-3.5 do not.
+_WEB_SEARCH_CAPABLE_PREFIXES = (
+    "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5",
+)
+_WEB_SEARCH_EXCLUDED_KEYWORDS = ("instruct", "vision", "embedding", "whisper", "tts")
+
+
+def is_web_search_capable(model_id: str) -> bool:
+    """Return True if the OpenAI *model_id* is expected to support web_search_preview."""
+    mid = model_id.lower()
+    # Exclude known non-chat / non-tool models
+    for kw in _WEB_SEARCH_EXCLUDED_KEYWORDS:
+        if kw in mid:
+            return False
+    # Exclude reasoning-only models (o1, o3, o4 series)
+    if re.match(r'^o\d', mid):
+        return False
+    # Accept known capable prefixes
+    for prefix in _WEB_SEARCH_CAPABLE_PREFIXES:
+        if mid.startswith(prefix):
+            return True
+    return False
+
