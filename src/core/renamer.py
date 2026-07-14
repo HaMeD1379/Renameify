@@ -752,16 +752,17 @@ def generate_rename_plan(
         # Plex requires that all specials (season 0) live in a single "Specials"
         # folder directly under the show root, NOT inside Season XX sub-folders.
         platform = config.get("platform", "generic")
-        is_special = (info.season == 0) or (getattr(info, 'special_type', None) is not None)
+        is_special = (
+            info.media_type == "series" and
+            ((info.season == 0) or (getattr(info, 'special_type', None) is not None))
+        )
         if platform == "plex" and is_special:
             show_root = _find_show_root_for_specials(media_file.path, root_path)
-            if show_root is None:
-                # File is directly under scan root with no season parent — use root
-                show_root = Path(root_path)
-            target_specials_dir = show_root / "Specials"
-            # Only redirect if not already in the correct Specials folder
-            if media_file.path.parent != target_specials_dir:
-                new_path = target_specials_dir / new_filename_with_ext
+            if show_root is not None:
+                target_specials_dir = show_root / "Specials"
+                # Only redirect if not already in the correct Specials folder
+                if media_file.path.parent != target_specials_dir:
+                    new_path = target_specials_dir / new_filename_with_ext
 
         # Check if already correctly named (exact path match)
         if str(media_file.path) == str(new_path):

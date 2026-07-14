@@ -29,12 +29,100 @@ PLATFORM_JELLYFIN = "jellyfin"
 PLATFORM_EMBY = "emby"
 PLATFORM_GENERIC = "generic"
 
-# Plex Agent/Scanner options
-PLEX_AGENT_PLEX_MOVIE = "com.plexapp.agents.imdb"  # Plex Movie
-PLEX_AGENT_PLEX_SERIES = "com.plexapp.agents.thetvdb"  # Plex Series
-PLEX_AGENT_TMDB = "tv.plex.agents.movie"  # The Movie Database
-PLEX_SCANNER_PLEX_MOVIE = "Plex Movie"
-PLEX_SCANNER_PLEX_SERIES = "Plex TV Series"
+# Plex Agent/Scanner options. Values are stable app option keys; ids/names mirror
+# the current Plex library choices and include legacy values where Plex still
+# exposes them for migrated libraries.
+PLEX_AGENT_OPTIONS = {
+    "auto": {
+        "id": "",
+        "name": "Auto",
+        "library_type": "auto",
+        "description": "Use normal Renameify detection without forcing a Plex library type.",
+    },
+    "plex_movie": {
+        "id": "tv.plex.agents.movie",
+        "name": "Plex Movie",
+        "library_type": "movie",
+        "description": "Current default movie metadata agent.",
+    },
+    "plex_series": {
+        "id": "tv.plex.agents.series",
+        "name": "Plex Series",
+        "library_type": "series",
+        "description": "Current default TV metadata agent.",
+    },
+    "personal_media": {
+        "id": "com.plexapp.agents.none",
+        "name": "Personal Media",
+        "library_type": "other",
+        "description": "For videos that should not match online databases.",
+    },
+    "legacy_thetvdb": {
+        "id": "com.plexapp.agents.thetvdb",
+        "name": "TheTVDB (Legacy)",
+        "library_type": "series",
+        "description": "Legacy TV agent retained for older libraries.",
+    },
+    "legacy_tmdb": {
+        "id": "com.plexapp.agents.themoviedb",
+        "name": "The Movie Database (Legacy)",
+        "library_type": "movie",
+        "description": "Legacy movie agent; Plex recommends Plex Movie instead.",
+    },
+}
+
+PLEX_SCANNER_OPTIONS = {
+    "auto": {
+        "id": "",
+        "name": "Auto",
+        "library_type": "auto",
+        "description": "Let Renameify classify movies and shows from folder context.",
+    },
+    "plex_movie": {
+        "id": "Plex Movie",
+        "name": "Plex Movie",
+        "library_type": "movie",
+        "description": "Current default movie scanner paired with Plex Movie.",
+    },
+    "plex_tv_series": {
+        "id": "Plex TV Series",
+        "name": "Plex TV Series",
+        "library_type": "series",
+        "description": "Current default TV scanner paired with Plex Series.",
+    },
+    "plex_video_files": {
+        "id": "Plex Video Files",
+        "name": "Plex Video Files",
+        "library_type": "other",
+        "description": "Less strict personal-video scanner; no online matching.",
+    },
+    "legacy_movie": {
+        "id": "Plex Movie Scanner",
+        "name": "Plex Movie Scanner (Legacy)",
+        "library_type": "movie",
+        "description": "Deprecated movie scanner for older libraries.",
+    },
+    "legacy_series": {
+        "id": "Plex Series Scanner",
+        "name": "Plex Series Scanner (Legacy)",
+        "library_type": "series",
+        "description": "Deprecated TV scanner for older libraries.",
+    },
+}
+
+PLEX_EPISODE_ORDERING_OPTIONS = {
+    "tmdb_aired": "The Movie Database (Aired)",
+    "tvdb_aired": "TheTVDB (Aired)",
+    "tvdb_dvd": "TheTVDB (DVD)",
+    "tvdb_absolute": "TheTVDB (Absolute)",
+}
+
+# Backwards-compatible constants used by older code/configs.
+PLEX_AGENT_PLEX_MOVIE = PLEX_AGENT_OPTIONS["plex_movie"]["id"]
+PLEX_AGENT_PLEX_SERIES = PLEX_AGENT_OPTIONS["plex_series"]["id"]
+PLEX_AGENT_TMDB = PLEX_AGENT_OPTIONS["legacy_tmdb"]["id"]
+PLEX_SCANNER_PLEX_MOVIE = PLEX_SCANNER_OPTIONS["plex_movie"]["id"]
+PLEX_SCANNER_PLEX_SERIES = PLEX_SCANNER_OPTIONS["plex_tv_series"]["id"]
 
 
 def get_documents_dir() -> Path:
@@ -121,7 +209,7 @@ DEFAULT_CONFIG = {
     "openrouter_api_key": "",
 
     # Model selection
-    "openai_model": "gpt-4o",
+    "openai_model": "gpt-4o-mini",
     "anthropic_model": "claude-sonnet-4-20250514",
     "google_model": "gemini-2.0-flash",
     "openrouter_model": "openai/gpt-4o-mini",
@@ -130,8 +218,9 @@ DEFAULT_CONFIG = {
 
     # Platform settings
     "platform": PLATFORM_GENERIC,  # plex, jellyfin, emby, generic
-    "plex_agent": "",  # Empty = auto/disabled (optional)
-    "plex_scanner": "",  # Empty = auto/disabled (optional)
+    "plex_agent": "auto",
+    "plex_scanner": "auto",
+    "plex_episode_ordering": "tmdb_aired",
     "plex_options_enabled": False,  # Whether Plex-specific options are used
 
     # Mode settings
@@ -281,7 +370,7 @@ DEFAULT_CONFIG = {
     "default_target_path": "",
 
     # UI preferences
-    "ui_theme": "default",
+    "ui_theme": "dark",
     "show_advanced_options": False,
 
     # Session state (auto-saved on close, restored on open)
@@ -303,20 +392,70 @@ def load_config() -> dict:
                 user_config = json.load(f)
                 # Merge with defaults (user config takes priority)
                 config = {**DEFAULT_CONFIG, **user_config}
+                normalize_plex_options(config)
                 return config
         except (json.JSONDecodeError, IOError):
             pass
 
     # Return defaults and save them
-    save_config(DEFAULT_CONFIG.copy())
-    return DEFAULT_CONFIG.copy()
+    config = DEFAULT_CONFIG.copy()
+    normalize_plex_options(config)
+    save_config(config)
+    return config
 
 
 def save_config(config: dict) -> None:
     """Save configuration to file."""
+    normalize_plex_options(config)
     config_file = get_config_file()
     with open(config_file, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
+
+
+def normalize_plex_options(config: dict) -> dict:
+    """Normalize legacy/free-text Plex agent and scanner settings in-place."""
+    agent_aliases = {
+        "": "auto",
+        "auto": "auto",
+        "plex movie": "plex_movie",
+        "tv.plex.agents.movie": "plex_movie",
+        "plex series": "plex_series",
+        "plex tv series": "plex_series",
+        "tv.plex.agents.series": "plex_series",
+        "personal media": "personal_media",
+        "personal media shows": "personal_media",
+        "com.plexapp.agents.none": "personal_media",
+        "thetvdb": "legacy_thetvdb",
+        "thetvdb (legacy)": "legacy_thetvdb",
+        "com.plexapp.agents.thetvdb": "legacy_thetvdb",
+        "the movie database": "legacy_tmdb",
+        "the movie database (legacy)": "legacy_tmdb",
+        "com.plexapp.agents.themoviedb": "legacy_tmdb",
+        "com.plexapp.agents.imdb": "legacy_tmdb",
+    }
+    scanner_aliases = {
+        "": "auto",
+        "auto": "auto",
+        "plex movie": "plex_movie",
+        "plex movie scanner": "legacy_movie",
+        "plex movie scanner (legacy)": "legacy_movie",
+        "plex tv series": "plex_tv_series",
+        "plex series": "plex_tv_series",
+        "plex series scanner": "legacy_series",
+        "plex series scanner (legacy)": "legacy_series",
+        "plex video files": "plex_video_files",
+        "plex video files scanner": "plex_video_files",
+    }
+
+    agent = str(config.get("plex_agent", "auto")).strip()
+    scanner = str(config.get("plex_scanner", "auto")).strip()
+    ordering = str(config.get("plex_episode_ordering", "tmdb_aired")).strip()
+
+    config["plex_agent"] = agent if agent in PLEX_AGENT_OPTIONS else agent_aliases.get(agent.lower(), "auto")
+    config["plex_scanner"] = scanner if scanner in PLEX_SCANNER_OPTIONS else scanner_aliases.get(scanner.lower(), "auto")
+    if ordering not in PLEX_EPISODE_ORDERING_OPTIONS:
+        config["plex_episode_ordering"] = "tmdb_aired"
+    return config
 
 
 def get_api_key(provider: str = None) -> str:
@@ -373,22 +512,93 @@ def set_current_model(model: str, provider: str = None) -> None:
     save_config(config)
 
 
-# Available models for each provider (updated for latest 2025-2026 models)
-# This is the default/fallback list - can be updated dynamically via fetch_available_models()
+OPENAI_WEB_SEARCH_MODEL_LIMIT = 5
+
+# Curated for Renameify's workload: short JSON identification calls that benefit
+# from OpenAI Responses web search. Keep this list small so the UI is a decision,
+# not a raw model catalog.
+OPENAI_WEB_SEARCH_MODELS = [
+    {
+        "id": "gpt-4o-mini",
+        "name": "Recommended value",
+        "description": "Recommended value - fast, reliable, low cost",
+        "detail": "Best default for media lookup",
+        "cost_tier": "$",
+        "badge": "Recommended",
+    },
+    {
+        "id": "gpt-4.1-nano",
+        "name": "Lowest cost",
+        "description": "Lowest cost - smallest web-capable GPT",
+        "detail": "Use for large cheap batches",
+        "cost_tier": "$",
+        "badge": "Budget",
+    },
+    {
+        "id": "gpt-4.1-mini",
+        "name": "Balanced",
+        "description": "Balanced - better matching, still affordable",
+        "detail": "Use when messy releases need more context",
+        "cost_tier": "$$",
+        "badge": "Balanced",
+    },
+    {
+        "id": "gpt-4o",
+        "name": "Proven quality",
+        "description": "Proven quality - strong media reasoning",
+        "detail": "Use when accuracy matters more than cost",
+        "cost_tier": "$$$",
+        "badge": "Quality",
+    },
+    {
+        "id": "gpt-4.1",
+        "name": "Max accuracy",
+        "description": "Max accuracy - highest-cost fallback",
+        "detail": "Use for hard folders after review",
+        "cost_tier": "$$$$",
+        "badge": "Premium",
+    },
+]
+
+
+def _public_model_option(option: dict) -> dict:
+    item = dict(option)
+    item["supports_web_search"] = True
+    return item
+
+
+def _model_available(model_id: str, available_ids: Optional[set]) -> bool:
+    if not available_ids:
+        return True
+    return model_id in available_ids or any(item.startswith(f"{model_id}-") for item in available_ids)
+
+
+def get_openai_web_search_models(available_ids=None) -> list:
+    """Return exactly five ranked OpenAI web-search-capable model options."""
+    available = set(available_ids or [])
+    selected = []
+    selected_ids = set()
+
+    for option in OPENAI_WEB_SEARCH_MODELS:
+        if _model_available(option["id"], available):
+            selected.append(option)
+            selected_ids.add(option["id"])
+
+    # Preserve the five-option UX even if the model endpoint omits aliases.
+    for option in OPENAI_WEB_SEARCH_MODELS:
+        if len(selected) >= OPENAI_WEB_SEARCH_MODEL_LIMIT:
+            break
+        if option["id"] not in selected_ids:
+            selected.append(option)
+            selected_ids.add(option["id"])
+
+    return [_public_model_option(option) for option in selected[:OPENAI_WEB_SEARCH_MODEL_LIMIT]]
+
+
+# Available models for each provider. OpenAI is intentionally limited to the
+# five recommended web-search-capable options used by Test & Refresh.
 AVAILABLE_MODELS = {
-    "openai": [
-        ("gpt-4o-mini", "GPT-4o Mini - Fast & affordable"),
-        ("gpt-4o", "GPT-4o - Most capable multimodal"),
-        ("gpt-4-turbo", "GPT-4 Turbo - High performance"),
-        ("gpt-4.1", "GPT-4.1 - Latest GPT-4"),
-        ("gpt-4.1-mini", "GPT-4.1 Mini - Fast GPT-4.1"),
-        ("gpt-4.1-nano", "GPT-4.1 Nano - Ultra-fast"),
-        ("gpt-5", "GPT-5 - Next generation"),
-        ("gpt-5-mini", "GPT-5 Mini - Balance of speed & capability"),
-        ("o3", "o3 - Advanced reasoning"),
-        ("o3-mini", "o3-mini - Fast reasoning"),
-        ("o4-mini", "o4-mini - Latest reasoning model"),
-    ],
+    "openai": get_openai_web_search_models(),
     "anthropic": [
         ("claude-sonnet-4-20250514", "Claude Sonnet 4 - Balanced"),
         ("claude-opus-4-20250514", "Claude Opus 4 - Most capable"),
@@ -433,7 +643,10 @@ def get_available_models(provider: str = None) -> list:
     if provider is None:
         config = load_config()
         provider = config.get("llm_provider", "openai")
-    return AVAILABLE_MODELS.get(provider, AVAILABLE_MODELS["openai"])
+    models = AVAILABLE_MODELS.get(provider, AVAILABLE_MODELS["openai"])
+    if provider == "openai":
+        return get_openai_web_search_models()
+    return models[:OPENAI_WEB_SEARCH_MODEL_LIMIT]
 
 
 def get_platform_templates(platform: str) -> dict:
@@ -520,6 +733,7 @@ def fetch_available_models(provider: str = None, api_key: str = None) -> list:
     Returns list of tuples: (model_id, description)
     Falls back to cached/default list on error.
     """
+    import hashlib
     import time
     global _cached_models, _cache_timestamp
 
@@ -527,17 +741,17 @@ def fetch_available_models(provider: str = None, api_key: str = None) -> list:
         config = load_config()
         provider = config.get("llm_provider", "openai")
 
-    # Check cache
-    cache_key = provider
+    if api_key is None:
+        api_key = get_api_key(provider)
+
+    fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:10] if api_key else "none"
+    cache_key = f"{provider}:{fingerprint}"
     current_time = time.time()
     if cache_key in _cached_models and (current_time - _cache_timestamp) < MODEL_CACHE_DURATION:
         return _cached_models[cache_key]
 
-    if api_key is None:
-        api_key = get_api_key(provider)
-
     if not api_key:
-        return AVAILABLE_MODELS.get(provider, [])
+        return get_available_models(provider)
 
     try:
         models = _fetch_models_from_api(provider, api_key)
@@ -548,14 +762,15 @@ def fetch_available_models(provider: str = None, api_key: str = None) -> list:
     except Exception:
         pass
 
-    return AVAILABLE_MODELS.get(provider, [])
+    return get_available_models(provider)
 
 
 def _fetch_models_from_api(provider: str, api_key: str) -> list:
     """Internal function to fetch models from API.
 
-    For OpenAI, only models that support the web_search_preview tool (Responses API)
-    are returned.  For other providers, all chat-capable models are returned.
+    For OpenAI, only the five recommended Responses web-search models are
+    returned. Other providers are limited to their fallback top five because
+    Renameify does not implement provider-native web tools for them yet.
     """
     import httpx
 
@@ -575,13 +790,7 @@ def _fetch_models_from_api(provider: str, api_key: str) -> list:
                     model_id = m.get("id", "")
                     if is_web_search_capable(model_id):
                         capable.append(model_id)
-
-                # Sort: newer (longer/dated) models first, then deduplicate
-                capable = sorted(set(capable), reverse=True)
-
-                for model_id in capable[:20]:
-                    desc = _get_model_description(model_id)
-                    models.append((model_id, desc))
+                models = get_openai_web_search_models(set(capable))
         except Exception:
             pass
 
@@ -594,7 +803,7 @@ def _fetch_models_from_api(provider: str, api_key: str) -> list:
             )
             if response.status_code == 200:
                 data = response.json()
-                for m in data.get("data", [])[:40]:
+                for m in data.get("data", [])[:OPENAI_WEB_SEARCH_MODEL_LIMIT]:
                     model_id = m.get("id", "")
                     name = m.get("name", model_id)
                     if not name or name == model_id:
@@ -603,26 +812,23 @@ def _fetch_models_from_api(provider: str, api_key: str) -> list:
         except Exception:
             pass
 
-    return models
+    return models[:OPENAI_WEB_SEARCH_MODEL_LIMIT]
 
 
 def _get_model_description(model_id: str) -> str:
     """Generate a human-readable description for a model ID."""
     descriptions = {
-        "gpt-5": "GPT-5 - Next generation flagship",
-        "gpt-5-mini": "GPT-5 Mini - Fast next-gen",
-        "gpt-4o": "GPT-4o - Multimodal flagship",
         "gpt-4o-mini": "GPT-4o Mini - Fast & affordable",
-        "gpt-4-turbo": "GPT-4 Turbo - High performance",
-        "gpt-4.1": "GPT-4.1 - Latest GPT-4",
+        "gpt-4o": "GPT-4o - Multimodal flagship",
+        "gpt-4.1-nano": "GPT-4.1 Nano - Lowest cost",
         "gpt-4.1-mini": "GPT-4.1 Mini - Fast",
-        "o3": "o3 - Advanced reasoning",
-        "o3-mini": "o3-mini - Fast reasoning",
-        "o4-mini": "o4-mini - Latest reasoning",
+        "gpt-4.1": "GPT-4.1 - High accuracy",
+        "gpt-4-turbo": "GPT-4 Turbo - High performance",
     }
 
-    for key, desc in descriptions.items():
+    for key in sorted(descriptions, key=len, reverse=True):
         if key in model_id:
+            desc = descriptions[key]
             return desc
 
     return model_id.replace("-", " ").title()

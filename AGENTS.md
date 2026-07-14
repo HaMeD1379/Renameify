@@ -2,7 +2,7 @@
 
 ## Architecture Overview
 
-Windows-only Tkinter desktop app that scans media folders, sends filenames to an LLM for identification, and renames/reorganizes files to match Plex/Jellyfin/Emby naming conventions.
+Windows-only Flutter desktop app with a Python JSON-lines bridge. It scans media folders, sends filenames to an LLM for identification, and renames/reorganizes files to match Plex/Jellyfin/Emby naming conventions.
 
 **Core data flow:**
 ```
@@ -15,7 +15,8 @@ Scanner → MediaFile[]  →  gpt_service.identify_all_media → MediaInfo[]
 **Module map:**
 | Path | Responsibility |
 |------|----------------|
-| `Renameify.py` | Entry point; adds `src/` to `sys.path` in dev mode |
+| `flutter_app/lib/` | Flutter Windows UI |
+| `src/bridge/flutter_bridge.py` | JSON-lines bridge used by the Flutter UI |
 | `src/core/config.py` | Config load/save, `PLATFORM_TEMPLATES`, `DEFAULT_CONFIG` |
 | `src/core/gpt_service.py` | All LLM calls, `MediaInfo` dataclass, batching, cancellation |
 | `src/core/metadata.py` | Read/write file metadata (mutagen-based for audio/video tags) |
@@ -25,7 +26,6 @@ Scanner → MediaFile[]  →  gpt_service.identify_all_media → MediaInfo[]
 | `src/prompts/` | Built-in and custom LLM prompt management |
 | `src/platforms/base.py` | `Platform` ABC, `NamingTemplate` dataclass |
 | `src/platforms/{plex,jellyfin,emby,generic}.py` | Platform-specific implementations |
-| `src/gui/app.py` | Tkinter GUI (runs all heavy work on background threads) |
 | `src/utils/folder_filter.py` | Smart GPT-based folder classification (media vs. non-media) |
 | `src/utils/folder_fixer.py` | Auto-fix merged/malformed folder structures (`FolderFix` operations) |
 | `src/utils/drive_utils.py` | Windows drive enumeration (local + network paths) |
@@ -35,16 +35,19 @@ Scanner → MediaFile[]  →  gpt_service.identify_all_media → MediaInfo[]
 **Run in dev mode:**
 ```powershell
 pip install -r requirements.txt
-python Renameify.py
+cd flutter_app
+flutter pub get
+flutter run -d windows
 ```
 
-**Build portable EXE (non-interactive):**
+**Build installer (non-interactive):**
 ```bat
-build.bat portable     # → dist\portable\Renameify.exe
-build.bat release      # clean + bootstrap + both + verify
+build.bat installer    # → dist\Renameify-<version>-Setup.exe
+build.bat stage        # → dist\app\Renameify.exe + bridge
+build.bat release      # clean + bootstrap + installer + verify
 build.bat bootstrap    # create/repair .venv only
 ```
-`build.bat` creates `.venv` automatically and delegates to `build\build.py` (PyInstaller). The build uses `--paths=src` so all `src/` subpackages are bundled without path hacks.
+`build.bat` creates `.venv` automatically and delegates to `build\build.py`. Flutter output and the PyInstaller bridge are staged in `dist\app`; the installer is emitted directly under `dist`.
 
 **Config location (runtime):** `%USERPROFILE%\Documents\Renameify\renameify_config.json`  
 **Logs / rollback manifests:** `%USERPROFILE%\Documents\Renameify\logs\`

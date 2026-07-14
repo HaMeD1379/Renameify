@@ -15,63 +15,18 @@ Plex Scanners:
 - Plex TV Series: For TV show libraries
 """
 from typing import Dict, Optional
-from dataclasses import dataclass
 from .base import Platform, NamingTemplate
+from core.config import PLEX_AGENT_OPTIONS, PLEX_SCANNER_OPTIONS
 
 
-# Plex Agents
-PLEX_AGENTS = {
-    "plex_movie": {
-        "id": "com.plexapp.agents.imdb",
-        "name": "Plex Movie",
-        "description": "Plex's built-in movie agent using IMDB data",
-    },
-    "plex_series": {
-        "id": "com.plexapp.agents.thetvdb",
-        "name": "Plex Series",
-        "description": "Plex's built-in TV series agent using TheTVDB",
-    },
-    "tmdb_movie": {
-        "id": "tv.plex.agents.movie",
-        "name": "The Movie Database",
-        "description": "TMDB agent for movies (recommended)",
-    },
-    "tmdb_series": {
-        "id": "tv.plex.agents.series",
-        "name": "The Movie Database TV",
-        "description": "TMDB agent for TV series (recommended)",
-    },
-    "hama": {
-        "id": "com.plexapp.agents.hama",
-        "name": "HamaTV",
-        "description": "HTTP Anidb Metadata Agent for anime",
-    },
-}
-
-# Plex Scanners
-PLEX_SCANNERS = {
-    "plex_movie": {
-        "id": "Plex Movie",
-        "name": "Plex Movie Scanner",
-        "description": "Default scanner for movie libraries",
-    },
-    "plex_series": {
-        "id": "Plex TV Series",
-        "name": "Plex TV Series Scanner",
-        "description": "Default scanner for TV libraries",
-    },
-    "plex_music": {
-        "id": "Plex Music",
-        "name": "Plex Music Scanner",
-        "description": "Default scanner for music libraries",
-    },
-}
+PLEX_AGENTS = PLEX_AGENT_OPTIONS
+PLEX_SCANNERS = PLEX_SCANNER_OPTIONS
 
 
 class PlexPlatform(Platform):
     """Plex Media Server platform configuration."""
 
-    def __init__(self, agent: str = "tmdb_movie", scanner: str = "plex_movie"):
+    def __init__(self, agent: str = "auto", scanner: str = "auto"):
         self._agent = agent
         self._scanner = scanner
 
@@ -155,6 +110,6 @@ class PlexPlatform(Platform):
         return PLEX_SCANNERS
 
 
-def get_plex_platform(agent: str = "tmdb_movie", scanner: str = "plex_movie") -> PlexPlatform:
+def get_plex_platform(agent: str = "auto", scanner: str = "auto") -> PlexPlatform:
     """Factory function to create a Plex platform instance."""
     return PlexPlatform(agent=agent, scanner=scanner)

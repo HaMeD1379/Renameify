@@ -1,4 +1,4 @@
-# 🎬 Renameify v2.1.1
+# 🎬 Renameify v2.2.0
 
 <div align="center">
 
@@ -8,6 +8,7 @@ Transform chaotic media libraries into perfectly organized collections with GPT-
 
 [![License MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org)
+[![Flutter](https://img.shields.io/badge/Flutter-3.0%2B-blue.svg?style=flat-square)](https://flutter.dev)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-blue.svg?style=flat-square)]()
 
 **Perfect for:**
@@ -36,15 +37,15 @@ Renameify goes beyond simple regex patterns. Using advanced AI models with **liv
 
 ---
 
-## 🚀 Quick Start (GUI)
+## 🚀 Quick Start
 
-### Step 1: Download & Extract
-- **[Download Renameify 2.0.0 (Portable EXE)](https://github.com/HaMeD1379/Renameify/releases/download/v2.0.0/Renameify_v2.0.0.exe)**
-- Extract to any folder (no installation needed!)
+### Step 1: Install
+- Download the latest `Renameify-<version>-Setup.exe` from releases.
+- Run the installer and launch Renameify from the Start menu or desktop shortcut.
 
 ### Step 2: Add API Key
 1. Launch `Renameify.exe`
-2. Go to **Settings** → **API Configuration**
+2. Go to **Settings** → **LLM Provider**
 3. Choose your provider:
    - **OpenAI** (Recommended) — [Get API key](https://platform.openai.com/account/api-keys)
    - **Anthropic** — [Get API key](https://console.anthropic.com/)
@@ -52,7 +53,7 @@ Renameify goes beyond simple regex patterns. Using advanced AI models with **liv
 4. Paste your API key and test connection
 
 ### Step 3: Configure Platform
-1. Go to **Settings** → **Platform**
+1. Go to **Settings** → **Naming Mode**
 2. Select your media server:
    - **Generic** (default — works with any naming)
    - **Plex** (configure Agent/Scanner)
@@ -61,29 +62,35 @@ Renameify goes beyond simple regex patterns. Using advanced AI models with **liv
 
 ### Step 4: Scan & Rename
 1. Click **Browse** and select your media folder
-2. Click **Scan** to detect media files
-3. Review the proposed renames
-4. Click **Rename** to apply changes
+2. Click **Discover Files** or **Identify & Plan**
+3. Review and edit the proposed renames
+4. Click **Apply Selected** to apply changes
 5. Done! Your files are renamed and organized
 
 ---
 
-## 💻 Advanced Usage (Command Line)
+## 💻 Advanced Usage (Development)
 
 For developers and power users:
 
 ```bash
-# Install dependencies
+# Install Python dependencies
 pip install -r requirements.txt
 
-# Run in development mode
-python Renameify.py
+# Run Flutter UI in development mode
+cd flutter_app
+flutter pub get
+flutter run -d windows
 
-# Run unit tests
-python test_renameify.py
+# Run tests
+cd flutter_app
+flutter test
 
-# Build your own portable EXE
-python build/build.py
+cd ..
+python -m pytest tests/
+
+# Build installer
+build.bat installer
 ```
 
 ### Example: Batch Processing 50 TV Series Episodes
@@ -234,20 +241,37 @@ For specials, use Season 0 and descriptive titles.
 
 ---
 
-## 📦 What's New in v2.1.1
+## 📦 What's New in v2.2.0
 
-### 🔧 Fixes & Improvements
-- ✅ **Test & Refresh button** — The API Test button now also fetches the live model list in one click. For OpenAI, only models that support web search (Responses API + `web_search_preview` tool) are shown; incompatible models (o-series reasoning models, etc.) are automatically filtered out.
-- ✅ **Proper model names** — Models are fetched directly from the provider API and displayed with human-readable names.
-- ✅ **Plex Specials rules** — Specials nested inside `Season XX/Specials/` folders are now correctly consolidated to a single top-level `Specials/` folder under the show root, matching Plex's required structure:
-  ```
-  Show Name (Year)/
-    Season 01/
-    Season 02/
-    Specials/          ← All S00 episodes here
-      Show - S00E01 - Title.mkv
-  ```
-- ✅ **GUI scaling** — Compact two-row header uses less vertical space; Settings tab is now fully scrollable so nothing is hidden on small/1080p monitors; minimum window size reduced to 820×580.
+### 🎨 Major UI Overhaul
+- ✅ **Flutter Desktop UI** — Complete rewrite using Flutter for native Windows desktop experience
+  - Modern, responsive interface with smooth animations
+  - Better performance and resource management
+  - Improved UX with drag-and-drop support (coming soon)
+- ✅ **JSON-Lines Bridge** — Clean Python-Flutter communication via `flutter_bridge.py`
+  - Real-time progress updates during scanning and renaming
+  - Proper cancellation support throughout the pipeline
+  - Cleaner separation between UI and backend logic
+
+### 🧪 Testing & Quality
+- ✅ **Comprehensive Test Suite** — Added `tests/` directory with unit tests
+  - Scanner tests for file discovery
+  - Renamer tests for plan generation
+  - Config tests for settings persistence
+  - GPT service tests (mocked API calls)
+- ✅ **Better Error Handling** — More robust error recovery in all modules
+
+### 🏗️ Architecture Improvements
+- ✅ **Modular Bridge Design** — `src/bridge/` handles all Flutter communication
+- ✅ **Removed Legacy GUI** — Old PySimpleGUI code removed (`src/gui/`, `Renameify.py`)
+- ✅ **Build System** — Streamlined `build.bat` for Flutter + PyInstaller packaging
+- ✅ **No More Portable Build** — Focus on installer-only distribution
+
+### 🔧 Previous Release (v2.1.1) Highlights
+- ✅ **Test & Refresh button** — API Test button fetches live model list
+- ✅ **Proper model names** — Models displayed with human-readable names
+- ✅ **Plex Specials rules** — Correct folder consolidation
+- ✅ **GUI scaling** — Better support for 1080p monitors
 
 ## 📦 What's New in v2.1.0
 
@@ -312,8 +336,9 @@ This project is licensed under the **MIT License** — see [LICENSE](LICENSE) fi
 - 🤖 [OpenAI GPT-4o](https://openai.com/gpt-4) — AI model
 - 🧠 [Anthropic Claude](https://www.anthropic.com/) — Alternative AI
 - 🔍 [Google Gemini](https://deepmind.google/technologies/gemini/) — Another option
-- 🐍 [Python 3.10+](https://www.python.org/) — Language
-- 🎨 [Tkinter](https://docs.python.org/3/library/tkinter.html) — GUI toolkit
+- 🐍 [Python 3.10+](https://www.python.org/) — Backend language
+- 🎨 [Flutter 3.0+](https://flutter.dev/) — Cross-platform UI framework
+- 📦 [PyInstaller](https://www.pyinstaller.org/) — Python to executable bundling
 
 **Inspired by:**
 - [Plex](https://www.plex.tv/) Media Server

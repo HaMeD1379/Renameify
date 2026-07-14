@@ -42,7 +42,15 @@ except ImportError:
     google_genai = None
     google_genai_types = None
 
-from .config import load_config, get_api_key, get_current_model
+from .config import (
+    PLEX_AGENT_OPTIONS,
+    PLEX_EPISODE_ORDERING_OPTIONS,
+    PLEX_SCANNER_OPTIONS,
+    load_config,
+    get_api_key,
+    get_current_model,
+    normalize_plex_options,
+)
 
 # Use absolute import to work with sys.path setup (both dev and PyInstaller)
 try:
@@ -414,6 +422,13 @@ def test_llm_connection(
         config[model_key] = model_name
 
     resolved_model = config.get(model_key) or get_current_model()
+    require_web_search = bool(config.get("require_web_search", False))
+
+    if provider == "openai" and (require_web_search or config.get("use_web_search", True)):
+        return _test_openai_web_search_connection(api_key, resolved_model)
+
+    if require_web_search:
+        raise ValueError("Internet-access model testing is currently supported for OpenAI only.")
 
     # Keep test calls lightweight and deterministic.
     if provider == "openai":
@@ -442,14 +457,106 @@ def test_llm_connection(
     }
 
 
+def _extract_openai_response_text(response) -> str:
+    """Extract text from an OpenAI Responses API result across SDK shapes."""
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return output_text.strip()
+
+    content = ""
+    for output_item in getattr(response, "output", []) or []:
+        blocks = getattr(output_item, "content", None)
+        if not blocks and isinstance(output_item, dict):
+            blocks = output_item.get("content")
+        for block in blocks or []:
+            text = getattr(block, "text", None)
+            if text is None and isinstance(block, dict):
+                text = block.get("text")
+            if text:
+                content += text
+    return content.strip()
+
+
+def _openai_response_used_web_search(response) -> bool:
+    for output_item in getattr(response, "output", []) or []:
+        item_type = getattr(output_item, "type", None)
+        if item_type is None and isinstance(output_item, dict):
+            item_type = output_item.get("type")
+        if item_type and "web_search" in str(item_type):
+            return True
+    return False
+
+
+def _test_openai_web_search_connection(api_key: str, model: str) -> dict:
+    """Verify that the selected OpenAI model can run the Responses web search tool."""
+    if OpenAI is None:
+        raise ImportError("OpenAI package not installed. Run: pip install openai")
+    if not api_key or not api_key.strip():
+        raise ValueError("API key not configured for provider: openai")
+
+    client = OpenAI(api_key=api_key.strip(), timeout=60.0)
+    prompt = (
+        "Use the web search tool once to verify internet access. "
+        "Then return only this JSON array with no markdown or extra text: "
+        f"[{{\"status\":\"ok\",\"provider\":\"openai\",\"model\":\"{model}\",\"web_search\":true}}]"
+    )
+
+    last_error = None
+    for attempt in range(2):
+        if is_cancelled():
+            raise InterruptedError("Operation cancelled")
+        try:
+            response = client.responses.create(
+                model=model,
+                tools=[{"type": "web_search_preview"}],
+                input=prompt,
+                max_output_tokens=320,
+            )
+            content = _extract_openai_response_text(response)
+            if not content:
+                raise RuntimeError("OpenAI returned an empty web-search test response")
+            if not _openai_response_used_web_search(response):
+                raise RuntimeError("OpenAI did not report a web_search call for this model")
+
+            results = _extract_json_array(content)
+            if not results or not isinstance(results[0], dict):
+                raise ValueError("OpenAI responded, but the validation JSON was invalid.")
+            first = results[0]
+            if first.get("status") != "ok":
+                raise ValueError(f"Unexpected validation payload: {first}")
+
+            return {
+                "provider": "openai",
+                "model": first.get("model") or model,
+                "web_search": True,
+                "parsed": first,
+                "raw_response": content,
+            }
+        except InterruptedError:
+            raise
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            if "rate" in err_str or "429" in err_str or "quota" in err_str:
+                _sleep_with_cancel(2.0 * (2 ** attempt))
+                continue
+            if "timeout" in err_str or "timed out" in err_str:
+                _sleep_with_cancel(1.0)
+                continue
+            break
+
+    raise RuntimeError(f"OpenAI web-search test failed for {model}: {last_error}")
+
+
 def _call_openai(system_prompt: str, user_prompt: str, config: dict, api_key: str, max_tokens: int = 4096) -> str:
     """Call OpenAI API with web search support and robust error handling."""
     if OpenAI is None:
         raise ImportError("OpenAI package not installed. Run: pip install openai")
 
     client = OpenAI(api_key=api_key, timeout=90.0)
-    model = config.get("openai_model", "gpt-4o")
+    model = config.get("openai_model", "gpt-4o-mini")
     use_web_search = config.get("use_web_search", True)
+    require_web_search = bool(config.get("require_web_search", False))
 
     # --- Try Responses API with web search first ---
     if use_web_search:
@@ -464,12 +571,7 @@ def _call_openai(system_prompt: str, user_prompt: str, config: dict, api_key: st
                     input=f"{system_prompt}\n\n{user_prompt}",
                     max_output_tokens=max_tokens,
                 )
-                content = ""
-                for output_item in response.output:
-                    if hasattr(output_item, 'content'):
-                        for block in output_item.content:
-                            if hasattr(block, 'text'):
-                                content += block.text
+                content = _extract_openai_response_text(response)
                 if content.strip():
                     return content.strip()
                 last_ws_error = "Empty response from web search"
@@ -484,6 +586,9 @@ def _call_openai(system_prompt: str, user_prompt: str, config: dict, api_key: st
                     _sleep_with_cancel(1.0)
                     continue
                 break
+
+        if require_web_search:
+            raise RuntimeError(f"OpenAI web search failed for {model}: {last_ws_error}")
 
     # --- Standard Chat Completions API fallback ---
     last_error = None
@@ -777,6 +882,68 @@ def _match_filename_to_lookup(original_fn: str, path_lookup: dict) -> str:
     return ""
 
 
+def _plex_library_context(config: dict) -> str:
+    """Return compact Plex-specific identification hints based on selected options."""
+    if config.get("platform") != "plex" or not config.get("plex_options_enabled"):
+        return ""
+
+    normalize_plex_options(config)
+    scanner_key = config.get("plex_scanner", "auto")
+    agent_key = config.get("plex_agent", "auto")
+    ordering_key = config.get("plex_episode_ordering", "tmdb_aired")
+    scanner = PLEX_SCANNER_OPTIONS.get(scanner_key, PLEX_SCANNER_OPTIONS["auto"])
+    agent = PLEX_AGENT_OPTIONS.get(agent_key, PLEX_AGENT_OPTIONS["auto"])
+    ordering = PLEX_EPISODE_ORDERING_OPTIONS.get(ordering_key, "The Movie Database (Aired)")
+
+    lines = [
+        "PLEX LIBRARY OPTIONS:",
+        f"- Scanner: {scanner['name']}",
+        f"- Agent: {agent['name']}",
+    ]
+
+    scanner_type = scanner.get("library_type")
+    if scanner_type == "movie":
+        lines.append("- Treat this as a Plex movie library. Prefer media_type=\"movie\" for feature films and media_type=\"unknown\" for TV episode-style files, because Plex movie scanners ignore TV episodes.")
+        lines.append("- Use Plex movie naming: Movie Name (Year), with the year when known.")
+    elif scanner_type == "series":
+        lines.append("- Treat this as a Plex TV library. Prefer media_type=\"series\" for episodic/date-based content and media_type=\"unknown\" for standalone movie files.")
+        lines.append("- Use the English word \"Season\" for season directories; Specials are season 0.")
+        lines.append(f"- Episode ordering preference: {ordering}. Use that source/order when identifying episode numbers and titles.")
+    elif scanner_type == "other":
+        lines.append("- Treat this as personal/other video content. Only return movie or series when the file clearly matches an online title; otherwise return media_type=\"unknown\".")
+
+    agent_type = agent.get("library_type")
+    if agent_type == "movie":
+        lines.append("- The selected Plex agent is movie-oriented; do not classify TV episodes as movies.")
+    elif agent_type == "series":
+        lines.append("- The selected Plex agent is series-oriented; include series year when known and use SxxExx episode matching.")
+    elif agent_type == "other":
+        lines.append("- The selected Plex agent is personal-media-oriented; avoid inventing online metadata for ambiguous files.")
+
+    return "\n".join(lines)
+
+
+def _apply_plex_scanner_rules(item: dict, config: dict) -> tuple[str, Optional[str]]:
+    """Apply Plex scanner library-type rules after model output."""
+    media_type = item.get("media_type", "unknown")
+    note = item.get("notes")
+    if config.get("platform") != "plex" or not config.get("plex_options_enabled"):
+        return media_type, note
+
+    normalize_plex_options(config)
+    scanner = PLEX_SCANNER_OPTIONS.get(config.get("plex_scanner", "auto"), PLEX_SCANNER_OPTIONS["auto"])
+    scanner_type = scanner.get("library_type")
+    if scanner_type == "movie" and media_type == "series":
+        reason = "Skipped because the selected Plex movie scanner ignores TV episode-style content."
+        return "unknown", f"{note}; {reason}" if note else reason
+    if scanner_type == "series" and media_type == "movie":
+        reason = "Skipped because the selected Plex TV Series scanner expects episodic TV content."
+        return "unknown", f"{note}; {reason}" if note else reason
+    if scanner_type == "other" and media_type not in {"movie", "series"}:
+        return "unknown", note
+    return media_type, note
+
+
 def identify_media_batch(
     filenames_with_paths: List[tuple],
     config: Optional[dict] = None,
@@ -815,8 +982,13 @@ def identify_media_batch(
     prompt_manager = get_prompt_manager()
     if custom_prompt:
         prompt_manager.set_custom_prompt(custom_prompt)
+    else:
+        prompt_manager.clear_custom_prompt()
 
     system_prompt = prompt_manager.get_media_system_prompt()
+    plex_context = _plex_library_context(config)
+    if plex_context:
+        system_prompt = f"{system_prompt}\n\n{plex_context}"
     user_prompt = prompt_manager.get_media_user_prompt(filename_list)
 
     # Call LLM with retry on failure
@@ -858,6 +1030,8 @@ def identify_media_batch(
         if original_path:
             matched_paths.add(original_path)
 
+        media_type, notes = _apply_plex_scanner_rules(item, config)
+
         # Override season from folder path
         extracted_season = extract_season_from_path(original_path)
         gpt_season = item.get("season")
@@ -867,20 +1041,31 @@ def identify_media_batch(
         folder_special_type = extract_special_type_from_path(original_path)
         gpt_special_type = item.get("special_type")
         final_special_type = folder_special_type or gpt_special_type or None
+        final_episode = item.get("episode")
+        final_episode_title = item.get("episode_title")
+
+        # Movies are never TV specials. Folder-derived season/special hints are
+        # useful for series, but they can misclassify standalone movies stored in
+        # folders named "Specials", "Extras", or similar.
+        if media_type == "movie":
+            final_season = None
+            final_episode = None
+            final_episode_title = None
+            final_special_type = None
 
         media_info = MediaInfo(
             original_filename=original_fn,
             original_path=original_path,
-            media_type=item.get("media_type", "unknown"),
+            media_type=media_type,
             title=item.get("title", "Unknown"),
             year=item.get("year"),
             year_start=item.get("year_start"),
             year_end=item.get("year_end"),
             season=final_season,
-            episode=item.get("episode"),
-            episode_title=item.get("episode_title"),
+            episode=final_episode,
+            episode_title=final_episode_title,
             confidence=item.get("confidence", 0),
-            notes=item.get("notes"),
+            notes=notes,
             special_type=final_special_type,
         )
         media_infos.append(media_info)

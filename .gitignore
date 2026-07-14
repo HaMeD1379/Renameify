@@ -23,9 +23,34 @@ wheels/
 .installed.cfg
 *.egg
 
+# Flutter frontend source (the Python rules above also match nested lib/ dirs)
+!flutter_app/
+!flutter_app/lib/
+!flutter_app/lib/**
+!flutter_app/test/
+!flutter_app/test/**
+!flutter_app/android/
+!flutter_app/android/app/
+!flutter_app/android/app/src/
+!flutter_app/android/app/src/**
+!flutter_app/android/gradle/
+!flutter_app/android/gradle/**
+!flutter_app/android/*.kts
+!flutter_app/android/gradle.properties
+!flutter_app/windows/
+!flutter_app/windows/**
+!flutter_app/pubspec.yaml
+!flutter_app/pubspec.lock
+!flutter_app/README.md
+!flutter_app/analysis_options.yaml
+!flutter_app/.gitignore
+!flutter_app/.metadata
+!flutter_app/windows/runner/runner.exe.manifest
+
 # PyInstaller
 *.manifest
 *.spec
+!flutter_app/windows/runner/runner.exe.manifest
 
 # Installer logs
 pip-log.txt
@@ -42,8 +67,9 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
-test_*.py
 test_media_folder/
+test_*.py
+!tests/test_*.py
 
 # Virtual environments
 .venv/
@@ -73,21 +99,22 @@ renamer_config.json
 renameify_config.json
 
 # Build artifacts
+dist/
 *.exe
 *.dll
 *.pyd
 build/output/
 build/*.spec
+build/*.iss
 onefile/
-
-# Allow the portable release executable
-!dist/portable/Renameify.exe
 
 # Temporary files
 *.tmp
 *.temp
 *.bak
 _*.py
+!tests/__init__.py
+!src/bridge/__init__.py
 
 # Development documentation
 CLAUDE.md
